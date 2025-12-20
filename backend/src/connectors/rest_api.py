@@ -28,10 +28,21 @@ class RestApiConnector(BaseConnector):
             return False
 
     def extract_data(self, object_type: str) -> Generator[dict[str, Any], None, None]:
-        """Extrait les données avec associations via v4 API."""
+        """Extrait les données AVEC ASSOCIATIONS via v3 API."""
         
-        # Utilisation de l'API v4 pour capturer les liens complexes
-        next_url = f"https://api.hubapi.com/crm/v4/objects/{object_type}?limit=100&associations=companies,contacts,deals"
+        properties = "firstname,lastname,email,name,dealname"
+        associations_param = ""
+        
+        # ✅ FIX CRITIQUE : Associations réelles
+        if object_type == "contacts":
+            associations_param = "&associations=companies"
+            logger.info("📡 Contacts : associations=companies activé")
+        elif object_type == "deals":
+            associations_param = "&associations=companies,contacts"
+        elif object_type == "companies":
+            associations_param = "&associations=contacts"
+        
+        next_url = f"https://api.hubapi.com/crm/v3/objects/{object_type}?limit=100&properties={properties}{associations_param}"
         
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -54,6 +65,7 @@ class RestApiConnector(BaseConnector):
             except Exception as e:
                 logger.error(f"💥 Erreur lors de l'extraction : {e}")
                 break
+
 
     def _extract_existing_id(self, error_response: dict) -> str:
         """Extrait l'ID de l'objet existant depuis le message d'erreur HubSpot."""

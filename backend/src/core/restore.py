@@ -109,24 +109,27 @@ mais certaines entités liées n'existent plus dans le CRM actuel.
         return association_map.get((from_type, to_type), 1)
 
     def _restore_associations(self, object_type: str, old_id: str, current_id: str, item_data: dict = None):
-        """Recrée les associations dans HubSpot après restauration (Hybride JSON/Graphe)."""
         relations = {}
-        # 1. Extraction depuis les liens injectés dans le JSON (Nouveaux snapshots)
+        
+        # 1. PRIORITÉ : Liens JSON (nouveaux snapshots avec fix)
         if item_data and "_zibridge_links" in item_data:
             links = item_data["_zibridge_links"]
+            logger.debug(f"📦 JSON links trouvés: {links}")
             if "company_id" in links:
-                relations.setdefault("companies", []).append(links["company_id"])
+                relations["companies"] = [links["company_id"]]
             if "contact_id" in links:
-                relations.setdefault("contacts", []).append(links["contact_id"])
+                relations["contacts"] = [links["contact_id"]]
         
-        # 2. Repli sur Neo4j si aucune donnée JSON
+        # 2. FALLBACK Neo4j (anciens snapshots)
         if not relations:
             relations = self.graph.get_entity_relations(object_type, old_id, self.snapshot_id)
+            logger.debug(f"🧠 Neo4j fallback: {relations}")
         
         if not relations:
-            logger.debug(f"Aucune association à restaurer pour {object_type}/{old_id}")
+            logger.debug(f"ℹ️ Aucune relation pour {object_type}/{old_id}")
             return
         
+        # Restauration (ton code existant parfait)
         associations_count = 0
         for related_type, related_ids in relations.items():
             for old_related_id in related_ids:
@@ -140,12 +143,12 @@ mais certaines entités liées n'existent plus dans le CRM actuel.
                     association_type_id=assoc_type_id
                 )
                 if success:
-                    logger.success(f"🔗 Lien restauré : {object_type}/{current_id} → {related_type}/{actual_related_id}")
+                    logger.success(f"🔗 RESTAURÉ: {object_type}/{current_id} → {related_type}/{actual_related_id}")
                     associations_count += 1
         
-        if associations_count > 0:
-            logger.info(f"✨ {associations_count} associations rétablies pour cet objet.")
+        logger.info(f"✨ {associations_count} assos rétablies pour {object_type}/{current_id}")
 
+   
     def _save_id_mapping(self, object_type: str, old_id: str, new_id: str):
         """Sauvegarde le mapping old_id → new_id en DB et en cache."""
         self.id_mapping[f"{object_type}/{old_id}"] = new_id
@@ -186,11 +189,24 @@ mais certaines entités liées n'existent plus dans le CRM actuel.
             ids_to_res = objects_to_restore[obj_type]
             try:
                 all_data = self.snap_engine.get_all_items_from_minio(obj_type)
-                for item in all_data:
-                    ext_id = self._extract_id(item, obj_type)
-                    if ext_id not in ids_to_res:
-                        report["skipped"] += 1
-                        continue
+                for obj_type in ["companies", "contacts", "deals"]:
+                    if obj_type not in objects_to_restore: continue
+                    ids_to_res = objects_to_restore[obj_type]
+                    
+                    # ✅ FIX : Récupère SEULEMENT les items du DIFF
+                    all_data = self.snap_engine.get_all_items_from_minio(obj_type)
+                    targeted_data = {self._extract_id(item, obj_type): item for item in all_data}
+                    
+                    logger.info(f"🎯 {len(ids_to_res)} {obj_type} ciblés sur {len(all_data)} total")
+                    
+                    for ext_id in ids_to_res:  # ✅ Boucle sur DIFF UNIQUEMENT
+                        if ext_id not in targeted_data:
+                            logger.warning(f"❌ {obj_type}/{ext_id} absent du snapshot #{self.snapshot_id}")
+                            report["failed"] += 1
+                            continue
+                        item = targeted_data[ext_id]  # ✅ Item précis
+                        display_name = self._get_display_name(obj_type, item)
+
                     
                     display_name = self._get_display_name(obj_type, item)
                     if not skip_checks:

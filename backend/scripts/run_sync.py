@@ -25,41 +25,77 @@ def link_snapshots_in_graph(parent_id, child_id):
 
 def extract_relations(item: dict, obj_type: str) -> dict:
     """
-    Extrait les relations d'un objet HubSpot via les propriétés et le bloc 'associations'.
+    Extrait les relations d'un objet HubSpot.
+    
+    Returns:
+        {
+            "company_id": "123",
+            "contact_id": "456",
+            "deal_id": "789"
+        }
     """
     relations = {}
-    props = item.get("properties", {})
-    assoc_data = item.get("associations", {})
     
     if obj_type == "contacts":
-        # Priorité aux associations explicites, sinon repli sur la propriété standard
-        companies = assoc_data.get("companies", {}).get("results", [])
-        if companies:
-            relations["company_id"] = str(companies[0]["id"])
-        elif props.get("associatedcompanyid"):
-            relations["company_id"] = str(props.get("associatedcompanyid"))
+        # Structure API HubSpot v4 : associations -> companies -> results -> [...]
+        associations = item.get("associations", {})
+        
+        if "companies" in associations:
+            companies_data = associations["companies"]
+            
+            # Cas 1: Format direct avec "results"
+            if isinstance(companies_data, dict) and "results" in companies_data:
+                results = companies_data["results"]
+                if results and len(results) > 0:
+                    relations["company_id"] = str(results[0]["id"])
+                    logger.debug(f"✅ Contact {item['id']} → Company {relations['company_id']}")
+            
+            # Cas 2: Format liste directe
+            elif isinstance(companies_data, list) and len(companies_data) > 0:
+                relations["company_id"] = str(companies_data[0]["id"])
+                logger.debug(f"✅ Contact {item['id']} → Company {relations['company_id']}")
     
     elif obj_type == "deals":
-        # Lien Deal → Company
-        companies = assoc_data.get("companies", {}).get("results", [])
-        if companies:
-            relations["company_id"] = str(companies[0]["id"])
-        elif props.get("associatedcompanyid"):
-            relations["company_id"] = str(props.get("associatedcompanyid")).split(";")[0]
+        associations = item.get("associations", {})
         
-        # Lien Deal → Contact
-        contacts = assoc_data.get("contacts", {}).get("results", [])
-        if contacts:
-            relations["contact_id"] = str(contacts[0]["id"])
+        # Deal → Company
+        if "companies" in associations:
+            companies_data = associations["companies"]
+            if isinstance(companies_data, dict) and "results" in companies_data:
+                results = companies_data["results"]
+                if results and len(results) > 0:
+                    relations["company_id"] = str(results[0]["id"])
+            elif isinstance(companies_data, list) and len(companies_data) > 0:
+                relations["company_id"] = str(companies_data[0]["id"])
+        
+        # Deal → Contact
+        if "contacts" in associations:
+            contacts_data = associations["contacts"]
+            if isinstance(contacts_data, dict) and "results" in contacts_data:
+                results = contacts_data["results"]
+                if results and len(results) > 0:
+                    relations["contact_id"] = str(results[0]["id"])
+            elif isinstance(contacts_data, list) and len(contacts_data) > 0:
+                relations["contact_id"] = str(contacts_data[0]["id"])
     
     elif obj_type == "tickets":
-        # Ticket → Contact / Company
+        props = item.get("properties", {})
+        
+        # Ticket → Contact
         contact_id = props.get("hs_ticket_contact_id")
+        if contact_id:
+            relations["contact_id"] = str(contact_id)
+        
+        # Ticket → Company
         company_id = props.get("hs_ticket_company_id")
-        if contact_id: relations["contact_id"] = str(contact_id)
-        if company_id: relations["company_id"] = str(company_id)
+        if company_id:
+            relations["company_id"] = str(company_id)
+    
+    if relations:
+        logger.debug(f"🔗 {obj_type}/{item['id']}: {relations}")
     
     return relations
+
 
 def sync_all():
     # 1. Création du Snapshot dans Postgres
@@ -108,6 +144,8 @@ def sync_all():
                     company_id=relations.get("company_id"),
                     contact_id=relations.get("contact_id")
                 )
+                if relations:
+                    logger.debug(f"🔗 Deal #{ext_id} → {relations}")
             
             count += 1
         
