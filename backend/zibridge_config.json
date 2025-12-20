@@ -1,0 +1,8 @@
+{
+  "ignore_columns": [
+    "last_update",
+    "sync_timestamp",
+    "temp_id",
+    "updated_at"
+  ]
+}

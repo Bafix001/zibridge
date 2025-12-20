@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+venv/
+env/
+.venv/
+
+# Environment
+.env
+
+# Docker data
+data/postgres/
+data/neo4j/
+data/minio/
+data/redis/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Tests
+.coverage
+.pytest_cache/
+htmlcov/

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Zibridge | Graph Intelligence</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        #cy { 
+            width: 100%; 
+            height: 750px; 
+            background: radial-gradient(circle, #1e293b 0%, #0f172a 100%); 
+        }
+        .loading-overlay {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(15, 23, 42, 0.8);
+            display: flex; justify-content: center; align-items: center;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body class="bg-[#0f172a] min-h-screen p-8 text-white font-sans">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-4xl font-black tracking-tighter text-blue-400 italic uppercase">
+                    Graph <span class="text-white">Intelligence</span>
+                </h1>
+                <p class="text-slate-400 text-sm font-mono mt-1">Exploration des relations métier et du lineage des données.</p>
+            </div>
+            <div class="flex gap-4">
+                <button onclick="location.reload()" class="bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-xl text-xs font-bold transition-all border border-slate-700 flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg> ACTUALISER
+                </button>
+                <a href="/" class="bg-blue-600 hover:bg-blue-500 px-6 py-2 rounded-xl text-sm font-bold transition-all shadow-lg shadow-blue-900/20">← DASHBOARD</a>
+            </div>
+        </div>
+
+        <div class="relative group">
+            <div id="cy" class="rounded-3xl border border-slate-800 shadow-2xl overflow-hidden"></div>
+            
+            <div class="absolute bottom-6 left-6 bg-slate-900/90 backdrop-blur-md p-4 rounded-2xl border border-slate-700 flex flex-col gap-3 shadow-2xl">
+                <div class="flex items-center gap-3">
+                    <span class="w-4 h-4 bg-blue-500 rounded-full border-2 border-blue-900"></span>
+                    <span class="text-[10px] font-black uppercase tracking-widest text-slate-300">Snapshot (Lineage)</span>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span class="w-4 h-4 bg-emerald-500 rounded-full border-2 border-emerald-900"></span>
+                    <span class="text-[10px] font-black uppercase tracking-widest text-slate-300">Contact (Individu)</span>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span class="w-4 h-2 bg-amber-500 border-2 border-amber-900"></span>
+                    <span class="text-[10px] font-black uppercase tracking-widest text-slate-300">Entreprise (Organisation)</span>
+                </div>
+            </div>
+        </div>
+        
+        <p class="mt-6 text-center text-slate-500 text-xs font-medium uppercase tracking-[0.3em]">
+            Zibridge Graph Engine • Mode Interactif Activé
+        </p>
+    </div>
+
+    <script>
+        async function renderGraph() {
+            try {
+                const response = await fetch('/graph-data');
+                const elements = await response.json();
+
+                const cy = cytoscape({
+                    container: document.getElementById('cy'),
+                    elements: elements,
+                    style: [
+                        // Style Global pour les labels
+                        {
+                            selector: 'node',
+                            style: {
+                                'label': 'data(label)',
+                                'color': '#f8fafc',
+                                'font-size': '11px',
+                                'font-weight': '600',
+                                'text-valign': 'bottom',
+                                'text-margin-y': '8px',
+                                'text-background-opacity': 0.5,
+                                'text-background-color': '#0f172a',
+                                'text-background-shape': 'roundrectangle',
+                                'text-background-padding': '2px'
+                            }
+                        },
+                        // Style Snapshots
+                        {
+                            selector: 'node[type="snapshot"]',
+                            style: {
+                                'background-color': '#3b82f6',
+                                'width': '50px',
+                                'height': '50px',
+                                'border-width': '3px',
+                                'border-color': '#1d4ed8',
+                                'overlay-color': '#3b82f6',
+                                'overlay-opacity': 0.2
+                            }
+                        },
+                        // Style Contacts
+                        {
+                            selector: 'node[type="contact"]',
+                            style: {
+                                'background-color': '#10b981',
+                                'width': '35px',
+                                'height': '35px',
+                                'border-width': '2px',
+                                'border-color': '#065f46'
+                            }
+                        },
+                        // Style Entreprises
+                        {
+                            selector: 'node[type="company"]',
+                            style: {
+                                'background-color': '#f59e0b',
+                                'shape': 'rectangle',
+                                'width': '60px',
+                                'height': '35px',
+                                'border-width': '2px',
+                                'border-color': '#92400e',
+                                'border-radius': '4px'
+                            }
+                        },
+                        // Style des liens (Edges)
+                        {
+                            selector: 'edge',
+                            style: {
+                                'width': 2,
+                                'line-color': '#334155',
+                                'target-arrow-color': '#475569',
+                                'target-arrow-shape': 'triangle-tee',
+                                'curve-style': 'unbundled-bezier',
+                                'arrow-scale': 1.2,
+                                'line-style': 'solid',
+                                'opacity': 0.6
+                            }
+                        }
+                    ],
+                    layout: {
+                        name: 'breadthfirst',
+                        directed: true,
+                        padding: 60,
+                        spacingFactor: 1.2,
+                        animate: true
+                    }
+                });
+
+                // --- Interactions ---
+                
+                // Redirection au clic sur un Snapshot
+                cy.on('tap', 'node[type="snapshot"]', function(evt){
+                    const id = evt.target.id();
+                    window.location.href = `/snapshot/${id}`;
+                });
+
+                // Effet de survol (Hover)
+                cy.on('mouseover', 'node', function(e) {
+                    e.target.style({ 'border-width': '6px', 'border-color': '#fff' });
+                    document.body.style.cursor = 'pointer';
+                });
+                cy.on('mouseout', 'node', function(e) {
+                    e.target.style({ 'border-width': '3px', 'border-color': e.target.style('background-color') });
+                    document.body.style.cursor = 'default';
+                });
+
+            } catch (error) {
+                console.error("Erreur lors du rendu du graphe:", error);
+            }
+        }
+
+        renderGraph();
+    </script>
+</body>
+</html>
