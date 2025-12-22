@@ -1,6 +1,6 @@
 import { DevtoolsProvider } from "@providers/devtools";
 import { useNotificationProvider } from "@refinedev/antd";
-import { GitHubBanner, Refine } from "@refinedev/core";
+import { Refine } from "@refinedev/core";
 import { RefineKbar, RefineKbarProvider } from "@refinedev/kbar";
 import routerProvider from "@refinedev/nextjs-router";
 import { Metadata } from "next";
@@ -10,6 +10,8 @@ import React, { Suspense } from "react";
 import { AntdRegistry } from "@ant-design/nextjs-registry";
 import { ColorModeContextProvider } from "@contexts/color-mode";
 import { dataProvider } from "@providers/data-provider";
+import { ZibridgeLayout } from "@/components/layout";
+import { App } from "antd"; // ✅ Ajouté pour le contexte global (Modals/Messages)
 import "@refinedev/antd/dist/reset.css";
 
 export const metadata: Metadata = {
@@ -30,39 +32,41 @@ export default async function RootLayout({
   const defaultMode = theme?.value === "dark" ? "dark" : "light";
 
   return (
-    <html lang="en">
+    <html lang="fr">
       <body>
         <Suspense>
-          <GitHubBanner />
           <RefineKbarProvider>
             <AntdRegistry>
               <ColorModeContextProvider defaultMode={defaultMode}>
-                <DevtoolsProvider>
-                  <Refine
-                    routerProvider={routerProvider}
-                    dataProvider={dataProvider}
-                    notificationProvider={useNotificationProvider}
-                    resources={[
-                      {
-                        name: "snapshots",
-                        list: "/snapshots",
-                        show: "/snapshots/show/:id",
-                        meta: {
-                          label: "Snapshots",
-                          icon: "📸",
+                {/* ✅ App doit entourer Refine et ZibridgeLayout */}
+                <App> 
+                  <DevtoolsProvider>
+                    <Refine
+                      routerProvider={routerProvider}
+                      dataProvider={dataProvider}
+                      notificationProvider={useNotificationProvider}
+                      resources={[
+                        {
+                          name: "snapshots",
+                          list: "/snapshots",
+                          show: "/snapshots/show/:id",
+                          meta: {
+                            label: "Snapshots",
+                            icon: "📸",
+                          },
                         },
-                      },
-                    ]}
-                    options={{
-                      syncWithLocation: true,
-                      warnWhenUnsavedChanges: true,
-                      projectId: "KxWnl9-QHAgen-jPvwxr",
-                    }}
-                  >
-                    {children}
-                    <RefineKbar />
-                  </Refine>
-                </DevtoolsProvider>
+                      ]}
+                      options={{
+                        syncWithLocation: true,
+                        warnWhenUnsavedChanges: true,
+                        projectId: "KxWnl9-QHAgen-jPvwxr",
+                      }}
+                    >
+                      <ZibridgeLayout>{children}</ZibridgeLayout>
+                      <RefineKbar />
+                    </Refine>
+                  </DevtoolsProvider>
+                </App>
               </ColorModeContextProvider>
             </AntdRegistry>
           </RefineKbarProvider>

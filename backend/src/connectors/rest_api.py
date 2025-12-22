@@ -9,12 +9,13 @@ from loguru import logger
 load_dotenv()
 
 class RestApiConnector(BaseConnector):
-    def __init__(self):
-        self.token = os.getenv("HUBSPOT_ACCESS_TOKEN")
+    def __init__(self, token: str = None):
+        # Si token fourni, on l'utilise, sinon on prend celui du .env
+        self.token = token or os.getenv("HUBSPOT_ACCESS_TOKEN")
         self.base_url = "https://api.hubapi.com/crm/v3/objects"
         
         if not self.token:
-            logger.error("❌ HUBSPOT_ACCESS_TOKEN manquant dans le .env")
+            logger.error("❌ HUBSPOT_ACCESS_TOKEN manquant")
 
     def test_connection(self) -> bool:
         """Vérifie si le token HubSpot est valide."""
@@ -28,21 +29,24 @@ class RestApiConnector(BaseConnector):
             return False
 
     def extract_data(self, object_type: str) -> Generator[dict[str, Any], None, None]:
-        """Extrait les données AVEC ASSOCIATIONS via v3 API."""
+        """Extrait les données AVEC ASSOCIATIONS et propriétés dynamiques."""
         
-        properties = "firstname,lastname,email,name,dealname"
+        # On définit les associations selon l'objet
         associations_param = ""
-        
-        # ✅ FIX CRITIQUE : Associations réelles
         if object_type == "contacts":
             associations_param = "&associations=companies"
-            logger.info("📡 Contacts : associations=companies activé")
         elif object_type == "deals":
             associations_param = "&associations=companies,contacts"
         elif object_type == "companies":
             associations_param = "&associations=contacts"
+        elif object_type == "tickets":
+            # ✅ Ajout vital pour la Suture des Tickets
+            associations_param = "&associations=companies,contacts"
+            logger.info("📡 Tickets : associations=companies,contacts activé")
         
-        next_url = f"https://api.hubapi.com/crm/v3/objects/{object_type}?limit=100&properties={properties}{associations_param}"
+        # On ne précise pas 'properties=' pour récupérer le set standard complet de HubSpot
+        # ou on adapte selon le type si besoin de champs spécifiques (ex: hs_pipeline)
+        next_url = f"https://api.hubapi.com/crm/v3/objects/{object_type}?limit=100{associations_param}"
         
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -57,15 +61,17 @@ class RestApiConnector(BaseConnector):
                     break
 
                 data = response.json()
-                for item in data.get("results", []):
+                results = data.get("results", [])
+                
+                for item in results:
                     yield item
 
                 paging = data.get("paging")
                 next_url = paging.get("next", {}).get("link") if paging else None
+                
             except Exception as e:
-                logger.error(f"💥 Erreur lors de l'extraction : {e}")
+                logger.error(f"💥 Erreur lors de l'extraction de {object_type}: {e}")
                 break
-
 
     def _extract_existing_id(self, error_response: dict) -> str:
         """Extrait l'ID de l'objet existant depuis le message d'erreur HubSpot."""

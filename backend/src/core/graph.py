@@ -1,12 +1,16 @@
-from src.utils.db import neo4j_driver
-from loguru import logger
 from typing import Dict, List, Set
+from loguru import logger
+from src.utils.db import neo4j_driver
+
 
 class GraphManager:
     def __init__(self):
         self.driver = neo4j_driver
 
+    # ================== VERSIONNAGE ==================
+
     def update_relation(self, snapshot_id: int, object_type: str, external_id: str, item_hash: str):
+        """Versionne l'entité dans le temps."""
         with self.driver.session() as session:
             query = """
             MERGE (e:Entity {external_id: $ext_id, type: $obj_type})
@@ -14,177 +18,114 @@ class GraphManager:
             CREATE (e)-[:HAS_VERSION {hash: $hash, at: datetime()}]->(s)
             """
             try:
-                session.run(query, 
-                    ext_id=external_id, 
-                    obj_type=object_type, 
-                    snap_id=snapshot_id, 
-                    hash=item_hash
+                session.run(
+                    query,
+                    ext_id=external_id,
+                    obj_type=object_type,
+                    snap_id=snapshot_id,
+                    hash=item_hash,
                 )
             except Exception as e:
-                logger.error(f"❌ Erreur Neo4j : {e}")
+                logger.error(f"❌ Erreur Neo4j (update_relation) : {e}")
 
-    def create_belongs_to(self, contact_ext_id: str, company_ext_id: str):
+    # ================== LIENS GÉNÉRIQUES ==================
+
+    def link_entities(self, from_id: str, from_type: str, to_id: str, to_type: str, relation_name: str):
+        """
+        Relie deux entités de n'importe quel type avec n'importe quelle étiquette.
+        Ex: link_entities("123", "deals", "456", "companies", "ASSOCIATED_WITH")
+        """
         with self.driver.session() as session:
-            query = """
-            MERGE (c:Entity {external_id: $c_id, type: 'contacts'})
-            MERGE (co:Entity {external_id: $co_id, type: 'companies'})
-            MERGE (c)-[:WORKS_AT]->(co)
+            query = f"""
+            MERGE (a:Entity {{external_id: $a_id, type: $a_type}})
+            MERGE (b:Entity {{external_id: $b_id, type: $b_type}})
+            MERGE (a)-[:{relation_name.upper()}]->(b)
             """
-            session.run(query, c_id=contact_ext_id, co_id=company_ext_id)            
+            try:
+                session.run(
+                    query,
+                    a_id=from_id,
+                    a_type=from_type,
+                    b_id=to_id,
+                    b_type=to_type,
+                )
+            except Exception as e:
+                logger.error(f"❌ Erreur Neo4j (link_entities) : {e}")
 
-    def create_deal_relations(self, deal_id: str, company_id: str = None, contact_id: str = None):
-        with self.driver.session() as session:
-            if company_id:
-                query_co = """
-                MATCH (d:Entity {external_id: $d_id, type: 'deals'})
-                MATCH (co:Entity {external_id: $co_id, type: 'companies'})
-                MERGE (d)-[:ASSOCIATED_WITH]->(co)
-                """
-                session.run(query_co, d_id=deal_id, co_id=company_id)
-
-            if contact_id:
-                query_c = """
-                MATCH (d:Entity {external_id: $d_id, type: 'deals'})
-                MATCH (c:Entity {external_id: $c_id, type: 'contacts'})
-                MERGE (d)-[:INVOLVES]->(c)
-                """
-                session.run(query_c, d_id=deal_id, c_id=contact_id)    
-
-    def create_ticket_relations(self, ticket_id: str, contact_id: str = None, company_id: str = None):
-        with self.driver.session() as session:
-            if contact_id:
-                query_c = """
-                MATCH (t:Entity {external_id: $t_id, type: 'tickets'})
-                MATCH (c:Entity {external_id: $c_id, type: 'contacts'})
-                MERGE (t)-[:REPORTED_BY]->(c)
-                """
-                session.run(query_c, t_id=ticket_id, c_id=contact_id)
-
-            if company_id:
-                query_co = """
-                MATCH (t:Entity {external_id: $t_id, type: 'tickets'})
-                MATCH (co:Entity {external_id: $co_id, type: 'companies'})
-                MERGE (t)-[:CONCERNS]->(co)
-                """
-                session.run(query_co, t_id=ticket_id, co_id=company_id)
-
-    # ========================================
-    # NOUVELLES FONCTIONS : ANALYSE D'IMPACT
-    # ========================================
+    # ================== ORPHANS & RELATIONS ==================
 
     def get_entity_relations(self, object_type: str, external_id: str, snapshot_id: int) -> Dict[str, List[str]]:
         """
-        Récupère toutes les relations d'une entité dans un snapshot donné.
-        
-        Returns:
-            {
-                "companies": ["123", "456"],
-                "contacts": ["789"],
-                "deals": ["101"]
-            }
+        Récupère toutes les relations sortantes d'une entité (hors HAS_VERSION).
+        Retourne { entity_type: [external_id1, external_id2, ...] }.
         """
         with self.driver.session() as session:
             query = """
             MATCH (e:Entity {external_id: $ext_id, type: $obj_type})-[r]->(related:Entity)
-            WHERE EXISTS {
-                MATCH (e)-[:HAS_VERSION]->(s:Snapshot {snap_id: $snap_id})
-            }
+            WHERE NOT type(r) = 'HAS_VERSION'
             RETURN type(r) as rel_type, related.type as entity_type, related.external_id as entity_id
             """
-            
-            result = session.run(query, ext_id=external_id, obj_type=object_type, snap_id=snapshot_id)
-            
-            relations = {}
-            for record in result:
-                entity_type = record["entity_type"]
-                entity_id = record["entity_id"]
-                
-                if entity_type not in relations:
-                    relations[entity_type] = []
-                relations[entity_type].append(entity_id)
-            
-            return relations
+            try:
+                result = session.run(query, ext_id=external_id, obj_type=object_type)
+                relations: Dict[str, List[str]] = {}
+                for record in result:
+                    e_type = record["entity_type"]
+                    e_id = record["entity_id"]
+                    relations.setdefault(e_type, []).append(e_id)
+                return relations
+            except Exception as e:
+                logger.error(f"❌ Erreur Neo4j (get_entity_relations) : {e}")
+                return {}
 
-    def check_orphans(self, object_type: str, external_id: str, snapshot_id: int, current_entities: Set[str]) -> Dict[str, List[str]]:
+    def check_orphans(
+        self,
+        object_type: str,
+        external_id: str,
+        snapshot_id: int,
+        current_crm_ids: Set[str],
+    ) -> Dict[str, List[str]]:
         """
-        Détecte les orphelins : relations du snapshot qui n'existent plus dans le CRM actuel.
-        
-        Args:
-            object_type: Type de l'objet à restaurer
-            external_id: ID de l'objet à restaurer
-            snapshot_id: Snapshot source
-            current_entities: Set des IDs actuellement présents dans le CRM
-        
-        Returns:
-            {
-                "missing_companies": ["123"],
-                "missing_contacts": ["789"],
-                "missing_deals": []
-            }
+        Vérifie quelles entités liées n'existent plus dans le CRM actuel.
+        Retourne par ex : {"missing_companies": ["123", "456"]}.
         """
-        # Récupérer les relations historiques
-        historical_relations = self.get_entity_relations(object_type, external_id, snapshot_id)
-        
-        orphans = {}
-        
-        for entity_type, entity_ids in historical_relations.items():
-            missing = [eid for eid in entity_ids if eid not in current_entities]
+        historical = self.get_entity_relations(object_type, external_id, snapshot_id)
+        orphans: Dict[str, List[str]] = {}
+        for rel_type, ids in historical.items():
+            missing = [oid for oid in ids if oid not in current_crm_ids]
             if missing:
-                orphans[f"missing_{entity_type}"] = missing
-        
+                orphans[f"missing_{rel_type}"] = missing
         return orphans
 
+    # ================== ANALYSE & VISU ==================
+
     def get_impact_analysis(self, object_type: str, external_id: str, snapshot_id: int) -> Dict:
-        """
-        Analyse complète de l'impact d'une restauration.
-        
-        Returns:
-            {
-                "entity": {"type": "contacts", "id": "123"},
-                "historical_relations": {
-                    "companies": ["456"],
-                    "deals": ["789"]
-                },
-                "relation_count": 2,
-                "complexity": "medium"  # low/medium/high
-            }
-        """
+        """Analyse la complexité relationnelle d'une entité pour un snapshot donné."""
         relations = self.get_entity_relations(object_type, external_id, snapshot_id)
         relation_count = sum(len(ids) for ids in relations.values())
-        
-        # Déterminer la complexité
-        if relation_count == 0:
-            complexity = "low"
-        elif relation_count <= 5:
-            complexity = "medium"
-        else:
+
+        complexity = "low"
+        if relation_count > 10:
             complexity = "high"
-        
+        elif relation_count > 3:
+            complexity = "medium"
+
         return {
             "entity": {"type": object_type, "id": external_id},
             "historical_relations": relations,
             "relation_count": relation_count,
-            "complexity": complexity
+            "complexity": complexity,
         }
 
     def visualize_entity_graph(self, object_type: str, external_id: str, snapshot_id: int) -> str:
-        """
-        Génère une représentation ASCII de l'entité et ses relations.
-        
-        Returns:
-            String ASCII art du graphe
-        """
+        """Représentation ASCII simple du graphe de l'entité."""
         relations = self.get_entity_relations(object_type, external_id, snapshot_id)
-        
-        graph = []
-        graph.append(f"\n┌─ {object_type.upper()} #{external_id}")
-        
-        for rel_type, entity_ids in relations.items():
-            graph.append(f"│")
-            graph.append(f"├─ {rel_type.upper()} ({len(entity_ids)})")
-            for eid in entity_ids:
-                graph.append(f"│  └─ #{eid}")
-        
-        graph.append("└─")
-        
-        return "\n".join(graph)
+        if not relations:
+            return f"Aucune relation trouvée pour {object_type} #{external_id} dans le Snap #{snapshot_id}"
+
+        lines = [f"┌─ {object_type.upper()} #{external_id}"]
+        for rel_type, ids in relations.items():
+            lines.append(f"├─ {rel_type.upper()} ({len(ids)})")
+            for i, eid in enumerate(ids):
+                connector = "└─" if i == len(ids) - 1 else "├─"
+                lines.append(f"│  {connector} #{eid}")
+        return "\n".join(lines)
