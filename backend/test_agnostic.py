@@ -1,4 +1,4 @@
-from src.connectors.csv_connector import CSVConnector
+from backend.src.connectors.file_connector import CSVConnector
 from src.core.snapshot import SnapshotEngine
 from src.core.models import Snapshot
 from src.utils.db import engine

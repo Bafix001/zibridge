@@ -113,8 +113,30 @@ def diff(base: int, target: int, project_id: int):
         diff_engine = DiffEngine(base, target, project_id=project_id)
         report = diff_engine.generate_detailed_report()
         
-        console.print(f"[green]+ {report['summary']['created']} Créés[/green] | [blue]~ {report['summary']['updated']} Modifiés[/blue] | [red]- {report['summary']['deleted']} Supprimés[/red]")
+        # Résumé
+        console.print(
+            f"[green]+ {report['summary']['created']} Créés[/green] | "
+            f"[blue]~ {report['summary']['updated']} Modifiés[/blue] | "
+            f"[red]- {report['summary']['deleted']} Supprimés[/red]"
+        )
 
+        # ⚡ SECTION 1 : OBJETS CRÉÉS
+        if report["details"]["created"]:
+            console.print("\n[bold green]➕ Objets créés :[/bold green]")
+            for item in report["details"]["created"]:
+                console.print(f"   • {item['type']} #{item['id']}")
+
+        # ⚡ SECTION 2 : OBJETS SUPPRIMÉS (C'ÉTAIT LE PROBLÈME !)
+        if report["details"]["deleted"]:
+            console.print("\n[bold red]➖ Objets supprimés :[/bold red]")
+            for item in report["details"]["deleted"]:
+                console.print(f"   • {item['type']} #{item['id']}")
+                
+                # Affichage des relations perdues
+                if item.get("lost_relations"):
+                    console.print(f"     [dim]Relations perdues : {', '.join(item['lost_relations'])}[/dim]")
+
+        # SECTION 3 : OBJETS MODIFIÉS
         if report["details"]["updated"]:
             console.print("\n[bold blue]🔎 Détails des modifications :[/bold blue]")
 
@@ -124,25 +146,37 @@ def diff(base: int, target: int, project_id: int):
 
                 console.print(f"\n📝 [bold cyan]{obj_type} #{obj_id}[/bold cyan]")
 
-                diff = diff_engine.get_diff_detail(
-                    obj_type=obj_type,
-                    obj_id=obj_id,
-                    old_hash=item["old_hash"],
-                    new_hash=item["new_hash"]
-                )
+                # On récupère le diff déjà calculé par le moteur
+                diff_data = item.get("diff", {})
 
-                if not diff:
-                    console.print("   [dim]Aucun changement visible[/dim]")
-                    continue
+                # 1. Affichage des PROPRIÉTÉS
+                props = diff_data.get("properties", {})
+                if props:
+                    for field, val in props.items():
+                        console.print(
+                            f"   • {field}: [red]{val['old']}[/red] ➔ [green]{val['new']}[/green]"
+                        )
 
-                for field, val in diff.items():
-                    console.print(
-                        f"   • {field}: [red]{val['old']}[/red] ➔ [green]{val['new']}[/green]"
-                    )
+                # 2. Affichage des RELATIONS
+                rels = diff_data.get("relations", {})
+                
+                if rels.get("removed"):
+                    for removed in rels["removed"]:
+                        console.print(f"   [bold red]🔗 Relation supprimée : {removed}[/bold red]")
+                
+                if rels.get("added"):
+                    for added in rels["added"]:
+                        console.print(f"   [bold green]🔗 Relation ajoutée : {added}[/bold green]")
+
+                # Si aucun changement détecté
+                if not props and not rels.get("removed") and not rels.get("added"):
+                    console.print("   [dim]Aucun changement détecté[/dim]")
 
     except Exception as e:
         console.print(f"[bold red]❌ Erreur Diff : {e}[/bold red]")
-
+        import traceback
+        logger.error(traceback.format_exc())
+        
 # ==============================================================================
 # 4. RESTAURATION AVEC PRE-FLIGHT (STARSHIP MODE)
 # ==============================================================================

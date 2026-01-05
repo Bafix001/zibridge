@@ -148,8 +148,74 @@ class HubSpotConnector(BaseConnector):
 
         return links
 
+    def get_associations(self, object_type: str, object_id: str) -> Dict[str, List[str]]:
+        """
+        🔗 Récupère toutes les associations d'un objet HubSpot via API v4.
+        """
+        associations = {}
+        
+        association_types = {
+            "contacts": ["companies", "deals"],
+            "companies": ["contacts", "deals"],
+            "deals": ["contacts", "companies"]
+        }
+        
+        if object_type not in association_types:
+            return associations
+        
+        for assoc_type in association_types[object_type]:
+            try:
+                url = f"https://api.hubapi.com/crm/v4/objects/{object_type}/{object_id}/associations/{assoc_type}"
+                response = self._request("GET", url)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get("results", [])
+                    
+                    if results:
+                        assoc_ids = [str(result["toObjectId"]) for result in results]
+                        associations[assoc_type] = assoc_ids
+                        logger.debug(f"✅ {len(assoc_ids)} associations {assoc_type} pour {object_type}:{object_id}")
+                
+            except Exception as e:
+                logger.debug(f"Pas d'association {assoc_type} pour {object_type} #{object_id}: {e}")
+        
+        return associations
+
     def get_association_definition(self, source_type: str, target_type: str) -> int:
         return self.DEFAULT_ASSOC_DEFS.get((source_type, target_type), 1)
+
+    # Dans src/connectors/hubspot.py
+
+    def create_association(
+    self, 
+    from_type: str, 
+    from_id: str, 
+    to_type: str, 
+    to_id: str
+) -> bool:
+        """🔗 Crée une association entre deux objets HubSpot via API v4."""
+        try:
+            assoc_id = self.get_association_definition(from_type, to_type)
+            url = f"https://api.hubapi.com/crm/v4/objects/{from_type}/{from_id}/associations/{to_type}/{to_id}"
+            
+            payload = [{
+                "associationCategory": "HUBSPOT_DEFINED",
+                "associationTypeId": assoc_id
+            }]
+            
+            response = self._request("PUT", url, json=payload)
+            
+            if response.status_code in (200, 201, 204):
+                logger.success(f"✅ Association créée : {from_type}:{from_id} → {to_type}:{to_id}")
+                return True
+            else:
+                logger.error(f"❌ Erreur association ({response.status_code}): {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Exception création association : {e}")
+            return False
 
     def batch_create_associations(self, associations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not associations:
@@ -176,7 +242,22 @@ class HubSpotConnector(BaseConnector):
         res = self._request("POST", path, json={"inputs": inputs})
         return res.json().get("results", []) if res.status_code in (200, 201, 207) else []
 
-    # ===================== UPSERT =====================
+    # ===================== UPSERT / CREATE / UPDATE =====================
+
+    def push_create(self, object_type: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """✅ Crée un nouvel objet."""
+        path = f"objects/{object_type}"
+        payload = {"properties": self._clean_props(properties)}
+        
+        response = self._request("POST", path, json=payload)
+        
+        if response.status_code in (200, 201):
+            result = response.json()
+            logger.success(f"✅ Créé : {object_type} #{result.get('id')}")
+            return result
+        else:
+            logger.error(f"❌ Erreur création {object_type}: {response.status_code}")
+            raise Exception(f"Failed to create {object_type}: {response.text}")
 
     def batch_push_upsert(self, object_type: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         path = f"objects/{object_type}/batch/create"
@@ -195,6 +276,44 @@ class HubSpotConnector(BaseConnector):
         payload = {"properties": self._clean_props(data)}
         res = self._request("PATCH", path, json=payload)
         return ("updated", None) if res.status_code < 400 else ("error", res.text)
+
+    def batch_update(self, object_type: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """📝 Met à jour plusieurs objets en batch."""
+        if not items:
+            return []
+        
+        path = f"objects/{object_type}/batch/update"
+        
+        inputs = [
+            {
+                "id": item["id"],
+                "properties": self._clean_props(item["properties"])
+            }
+            for item in items
+        ]
+        
+        payload = {"inputs": inputs}
+        response = self._request("POST", path, json=payload)
+        
+        if response.status_code in (200, 201):
+            results = response.json().get("results", [])
+            logger.success(f"📝 {len(results)} {object_type} mis à jour")
+            return results
+        else:
+            logger.error(f"❌ Erreur batch update : {response.status_code}")
+            return []
+
+    def delete(self, object_type: str, object_id: str) -> bool:
+        """🗑️ Supprime un objet."""
+        path = f"objects/{object_type}/{object_id}"
+        response = self._request("DELETE", path)
+        
+        if response.status_code == 204:
+            logger.success(f"🗑️ Supprimé : {object_type} #{object_id}")
+            return True
+        else:
+            logger.error(f"❌ Erreur suppression : {response.status_code}")
+            return False
 
     # ===================== UTILS =====================
 

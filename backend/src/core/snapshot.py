@@ -33,22 +33,24 @@ class SnapshotEngine:
         data = connector.normalize_data(raw_data, object_type)
         
         # 2. Capture des associations (Suture Chirurgicale)
-        if associations:
-            data["_zibridge_links"] = associations
-            for target_type, target_ids in associations.items():
-                ids_list = target_ids if isinstance(target_ids, list) else [target_ids]
-                for t_id in ids_list:
-                    self.graph.create_relation(
-                        from_id=external_id,
-                        from_type=object_type,
-                        to_id=str(t_id),
-                        to_type=target_type,
-                        rel_type="ASSOCIATED_WITH",
-                        project_id=getattr(connector, 'project_id', None)
-                    )
+        # Toujours inclure _zibridge_links, même vide
+        links = associations if associations else {}
+        data["_zibridge_links"] = links
+
+        for target_type, target_ids in links.items():
+            ids_list = target_ids if isinstance(target_ids, list) else [target_ids]
+            for t_id in ids_list:
+                self.graph.create_relation(
+                    from_id=external_id,
+                    from_type=object_type,
+                    to_id=str(t_id),
+                    to_type=target_type,
+                    rel_type="ASSOCIATED_WITH",
+                    project_id=getattr(connector, 'project_id', None)
+                )
                 
-        # 3. Hashing
-        item_hash = calculate_content_hash(data)
+        # 3. Hashing avec _zibridge_links inclus
+        item_hash = calculate_content_hash(data, include_links=True)
         self._all_hashes.append(item_hash)
         
         # 4. Stockage Blob (Dédoublonnage)
@@ -72,6 +74,7 @@ class SnapshotEngine:
 
         if len(self._batch_items) >= 500 or commit_now:
             self._flush_batch()
+
 
     def _flush_batch(self):
         """Flush batch SQL en masse pour la performance."""
