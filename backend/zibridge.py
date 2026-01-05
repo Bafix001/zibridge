@@ -1,214 +1,245 @@
 import typer
-import subprocess
 import sys
+import os
+import warnings
 from loguru import logger
 from rich.console import Console
 from rich.table import Table
-from sqlmodel import Session, select, func
-import warnings
+from rich.panel import Panel
+from rich.prompt import Confirm
+from sqlmodel import Session, select
+from typing import Optional
+from dotenv import load_dotenv
+
+# 🔥 Configuration environnement
+load_dotenv(os.path.join(os.getcwd(), ".env"))
+sys.path.append(os.getcwd())
+
+sys.path.append(os.path.join(os.getcwd(), "scripts"))
 
 # Imports internes
+# On utilise l'import direct de la fonction de synchro pour éviter les erreurs de chemin subprocess
+from scripts.run_sync import run_sync as execute_sync
 from src.core.diff import DiffEngine
 from src.core.restore import RestoreEngine
-from src.utils.db import engine, storage_manager
-from src.core.models import Snapshot, SnapshotItem
+from src.utils.db import engine
+from src.core.models import Snapshot, SnapshotProject, Branch
 
-# Suppression des warnings SSL polluants sur Mac
-warnings.filterwarnings("ignore", message=".*OpenSSL 1.1.1+.*")
+# Suppression des warnings polluants
+warnings.filterwarnings("ignore")
 
-app = typer.Typer(help="🚀 Zibridge CLI - Système de Versioning pour CRM")
+app = typer.Typer(help="🚀 Zibridge CLI - Système de Versioning pour CRM (Elon Mode)")
 console = Console()
 
-@app.command()
-def sync():
-    """Capture l'état actuel du CRM et crée un nouveau Snapshot."""
-    console.print("[bold green]🔄 Lancement de la synchronisation globale...[/bold green]")
-    try:
-        import os
-        # On ajoute le dossier actuel au PYTHONPATH pour que 'src' soit trouvé
-        env = os.environ.copy()
-        env["PYTHONPATH"] = os.getcwd() 
-
-        subprocess.run(
-            [sys.executable, "scripts/run_sync.py"], 
-            check=True, 
-            env=env  # On passe l'environnement mis à jour
-        )
-        console.print("[bold green]✨ Synchronisation terminée avec succès ![/bold green]")
-    except subprocess.CalledProcessError as e:
-        console.print(f"[bold red]❌ Erreur lors de la synchronisation : {e}[/bold red]")
+# ==============================================================================
+# 1. GESTION DES PROJETS & BRANCHES
+# ==============================================================================
 
 @app.command()
-def status():
-    """Affiche la liste des Snapshots avec le nombre d'objets contenus."""
+def projects():
+    """Liste tous les projets configurés."""
     with Session(engine) as session:
-        statement = select(Snapshot).order_by(Snapshot.id.desc()).limit(15)
-        snaps = session.exec(statement).all()
+        projs = session.exec(select(SnapshotProject)).all()
+        table = Table(title="📂 Projets Zibridge")
+        table.add_column("ID", style="cyan")
+        table.add_column("Nom", style="green")
+        table.add_column("Source", style="magenta")
         
-        if not snaps:
-            console.print("[yellow]⚠️ Aucun snapshot trouvé. Lancez 'python zibridge.py sync'.[/yellow]")
-            return
-
-        table = Table(title="📜 Historique des Snapshots Zibridge")
-        table.add_column("ID", style="cyan", justify="center")
-        table.add_column("Date de création", style="magenta")
-        table.add_column("Objets", style="yellow", justify="right")
-        table.add_column("Source", style="green")
-
-        for s in snaps:
-            # Comptage temps réel des items liés
-            count_stmt = select(func.count()).select_from(SnapshotItem).where(SnapshotItem.snapshot_id == s.id)
-            count = session.exec(count_stmt).one()
-            
-            date_val = getattr(s, 'created_at', None) or getattr(s, 'timestamp', "N/A")
-            date_str = date_val.strftime("%Y-%m-%d %H:%M") if hasattr(date_val, 'strftime') else str(date_val)
-            
-            table.add_row(str(s.id), date_str, str(count), s.source or "HubSpot API")
-        
+        for p in projs:
+            source = p.config.get("source_type", "N/A")
+            table.add_row(str(p.id), p.name, source)
         console.print(table)
 
 @app.command()
-def diff(base: int, target: int):
-    """Compare deux Snapshots et affiche les changements détaillés (CAS-based)."""
-    console.print(f"[bold]🤖 Analyse du Delta entre Snap #{base} et Snap #{target}...[/bold]")
+def branch(project_id: int, name: str):
+    """Crée une nouvelle branche pour un projet."""
+    with Session(engine) as session:
+        new_branch = Branch(name=name, project_id=project_id)
+        session.add(new_branch)
+        session.commit()
+        console.print(f"[bold green]✅ Branche '{name}' créée pour le projet {project_id}[/bold green]")
+
+# ==============================================================================
+# 2. SYNCHRONISATION (COMMIT) - VERSION OPTIMISÉE
+# ==============================================================================
+
+@app.command()
+def sync(
+    project_id: int = typer.Option(..., "--project", "-p"),
+    branch_id: int = typer.Option(..., "--branch", "-b")
+):
+    """Capture l'état actuel (Appel direct au moteur de synchro)."""
+    console.print(f"[bold yellow]🔄 Synchro en cours (Projet: {project_id}, Branche: {branch_id})...[/bold yellow]")
     
     try:
-        diff_engine = DiffEngine(base, target)
-        report = diff_engine.generate_report()
-        
-        # 1. Résumé statistique
-        console.print(f"\n[bold yellow]📊 BILAN :[/bold yellow]")
-        console.print(f"  [green]+ {len(report['created'])} Créations[/green]")
-        console.print(f"  [blue]~ {len(report['updated'])} Modifications[/blue]")
-        console.print(f"  [red]- {len(report['deleted'])} Suppressions[/red]\n")
-        
-        # 2. Affichage des créations
-        if report['created']:
-            console.print("[bold green]🆕 Nouveaux objets :[/bold green]")
-            for item in report['created']:
-                console.print(f"   [green]✔[/green] {item['type']} #{item['id']}")
+        # Appel direct de la fonction importée (plus robuste que subprocess)
+        execute_sync(project_id, branch_id)
+        console.print("[bold green]✨ Snapshot terminé, hashé et injecté dans Neo4j ![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]❌ Erreur lors de la synchro : {e}[/bold red]")
+        import traceback
+        logger.error(traceback.format_exc())
 
-        # 3. Affichage des modifications détaillées
-        if report['updated']:
-            console.print("\n[bold blue]📝 Détail des modifications :[/bold blue]")
-            for item in report['updated']:
-                # Récupération des deux versions du JSON dans MinIO
-                old_json = storage_manager.get_json(f"blobs/{item['old_hash']}.json")
-                new_json = storage_manager.get_json(f"blobs/{item['new_hash']}.json")
-                
-                p1 = old_json.get('properties', old_json)
-                p2 = new_json.get('properties', new_json)
-                
-                console.print(f"\n📦 [cyan]{item['type']} #{item['id']}[/cyan]")
-                
-                # Comparaison clé par clé des propriétés
-                for key in sorted(set(p1.keys()) | set(p2.keys())):
-                    val1, val2 = p1.get(key), p2.get(key)
-                    if val1 != val2:
-                        console.print(f"   🔶 {key}: [red]{val1}[/red] ➔ [green]{val2}[/green]")
+# ==============================================================================
+# 3. INSPECTION (STATUS & DIFF)
+# ==============================================================================
 
-        # 4. Affichage des suppressions
-        if report['deleted']:
-            console.print("\n[bold red]🗑️ Objets disparus (présents dans #{base} mais pas dans #{target}) :[/bold red]")
-            for item in report['deleted']:
-                console.print(f"   [red]✘[/red] {item['type']} #{item['id']}")
+@app.command()
+def status(project_id: Optional[int] = None):
+    """Affiche l'historique des snapshots."""
+    with Session(engine) as session:
+        statement = select(Snapshot)
+        if project_id:
+            statement = statement.where(Snapshot.project_id == project_id)
+        
+        snaps = session.exec(statement.order_by(Snapshot.id.desc()).limit(10)).all()
+        
+        table = Table(title="📜 Historique des Snapshots (Commits)")
+        table.add_column("ID", style="cyan")
+        table.add_column("Branche", style="blue")
+        table.add_column("Objets", style="yellow")
+        table.add_column("Statut", style="green")
+
+        for s in snaps:
+            table.add_row(str(s.id), str(s.branch_id), str(s.total_objects), s.status)
+        console.print(table)
+
+@app.command()
+def diff(base: int, target: int, project_id: int):
+    """Compare deux snapshots (PR Style)."""
+    console.print(Panel(f"🔍 Comparaison Snap #{base} ➔ Snap #{target}", style="bold blue"))
+    
+    try:
+        diff_engine = DiffEngine(base, target, project_id=project_id)
+        report = diff_engine.generate_detailed_report()
+        
+        console.print(f"[green]+ {report['summary']['created']} Créés[/green] | [blue]~ {report['summary']['updated']} Modifiés[/blue] | [red]- {report['summary']['deleted']} Supprimés[/red]")
+
+        if report["details"]["updated"]:
+            console.print("\n[bold blue]🔎 Détails des modifications :[/bold blue]")
+
+            for item in report["details"]["updated"]:
+                obj_type = item["type"]
+                obj_id = item["id"]
+
+                console.print(f"\n📝 [bold cyan]{obj_type} #{obj_id}[/bold cyan]")
+
+                diff = diff_engine.get_diff_detail(
+                    obj_type=obj_type,
+                    obj_id=obj_id,
+                    old_hash=item["old_hash"],
+                    new_hash=item["new_hash"]
+                )
+
+                if not diff:
+                    console.print("   [dim]Aucun changement visible[/dim]")
+                    continue
+
+                for field, val in diff.items():
+                    console.print(
+                        f"   • {field}: [red]{val['old']}[/red] ➔ [green]{val['new']}[/green]"
+                    )
 
     except Exception as e:
-        console.print(f"[bold red]❌ Erreur lors du calcul du diff : {e}[/bold red]")
+        console.print(f"[bold red]❌ Erreur Diff : {e}[/bold red]")
+
+# ==============================================================================
+# 4. RESTAURATION AVEC PRE-FLIGHT (STARSHIP MODE)
+# ==============================================================================
 
 @app.command()
 def restore(
     snap_id: int, 
-    only: str = typer.Option(None, "--only", "-o", help="Cibler un objet (ex: 'companies/123')")
+    project_id: int,
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    force: bool = typer.Option(False, "--force", "-f")
 ):
-    """Restaure les données du CRM vers un état passé (méthode classique)."""
-    target_msg = f"le Snap #{snap_id}" if not only else f"l'objet {only}"
+    """Restaure un snapshot avec analyse d'impact et batching."""
+    console.print(Panel(f"🛠️  Restauration du Snap #{snap_id}", style="bold magenta"))
     
-    if not typer.confirm(f"⚠️ Êtes-vous sûr de vouloir écraser les données actuelles par {target_msg} ?"):
-        raise typer.Abort()
-
-    console.print(f"[bold blue]🛠️ Restauration en cours...[/bold blue]")
     try:
-        restore_engine = RestoreEngine(snapshot_id=snap_id)
-        report = restore_engine.run_full_restore(
-            object_types=["companies", "contacts", "deals"],
-            target_only=only
-        )
-        console.print(f"\n[bold green]🏁 Rollback terminé ![/bold green]")
-        console.print(f"✅ Succès : {report['success']} | ❌ Échecs : {report['failed']}")
+        from src.connectors.factory import ConnectorFactory
+        
+        with Session(engine) as session:
+            project = session.get(SnapshotProject, project_id)
+            connector = ConnectorFactory.get_connector(
+                project.config.get("source_type", "hubspot"), 
+                project.config, 
+                project_id=project.id,
+                project_config=project.config
+            )
+            
+            # 1. Initialisation du moteur (Batch + Translation d'ID)
+            re = RestoreEngine(project_id, connector, snapshot_id=snap_id, dry_run=dry_run)
+            
+            # 2. ANALYSE PRE-FLIGHT (Impact)
+            with console.status("[bold green]Analyse des différences Snap ↔ CRM..."):
+                analysis = re.get_preflight_report()
+            
+            # 3. Affichage du rapport
+            re.display_preflight(analysis)
+
+            # 4. Confirmation utilisateur
+            if not dry_run and not force:
+                if not Confirm.ask("\n🔥 [bold red]Confirmez-vous l'application de ces changements sur le CRM ?[/]"):
+                    console.print("[yellow]Opération annulée par l'utilisateur.[/yellow]")
+                    return
+
+            # 5. Exécution (Batching & Suture automatique)
+            if dry_run:
+                console.print("\n[yellow]🧪 MODE SIMULATION ACTIVÉ[/yellow]")
+            
+            report = re.run()
+            
+            console.print(f"\n[bold green]🏁 Opération terminée ![/bold green]")
+            console.print(f"✅ Succès : {report['success']} | ❌ Échecs : {report['failed']} | 😴 Ignorés : {report.get('ignored', 0)}")
+            
     except Exception as e:
-        console.print(f"[bold red]❌ Erreur critique de restauration : {e}[/bold red]")
+        console.print(f"[bold red]❌ Erreur Restore : {e}[/bold red]")
+        import traceback
+        logger.error(traceback.format_exc())
+
+# ==============================================================================
+# 5. GRAPHE & SANTÉ
+# ==============================================================================
 
 @app.command()
-def smart_restore(
-    snap_id: int,
-    selective: bool = typer.Option(True, "--selective/--full", help="Mode sélectif (uniquement changements) ou complet"),
-    skip_checks: bool = typer.Option(False, "--skip-checks", help="Ignorer les vérifications de cohérence")
-):
-    """
-    🧠 Restauration intelligente avec Auto-Suture des associations.
+def graph_sync(snapshot_id: int, project_id: int):
+    """Génère le graphe Neo4j (Suture manuelle)."""
+    from src.core.graph import GraphManager
+    from src.core.snapshot import SnapshotEngine
     
-    Par défaut, restaure UNIQUEMENT les objets modifiés/supprimés (mode sélectif).
-    Utiliser --full pour restaurer TOUT le snapshot.
-    
-    Features:
-    - Mode sélectif : Restaure uniquement les changements (défaut)
-    - Ordre de dépendances respecté (companies → contacts → deals)
-    - Mapping automatique des IDs (old → new)
-    - Auto-Suture des associations
-    - Analyse d'impact relationnelle
-    
-    Exemples:
-    - Restauration sélective (défaut): python zibridge.py smart-restore 10
-    - Restauration complète: python zibridge.py smart-restore 10 --full
-    - Sans vérifications: python zibridge.py smart-restore 10 --skip-checks
-    """
-    
-    mode = "SÉLECTIVE (uniquement changements)" if selective else "COMPLÈTE (tout le snapshot)"
-    
-    if not typer.confirm(f"⚠️ Restauration {mode} du Snapshot #{snap_id}. Continuer ?"):
-        raise typer.Abort()
+    graph_mgr = GraphManager()
+    snap_engine = SnapshotEngine(snapshot_id=snapshot_id)
+    object_types = ["companies", "contacts", "deals"] 
 
-    console.print(f"[bold magenta]🧠 Restauration Intelligente en cours...[/bold magenta]")
-    console.print(f"[dim]Mode: {mode}[/dim]")
-    console.print("[dim]Ordre: Companies → Contacts → Deals[/dim]\n")
+    for obj_type in object_types:
+        items = snap_engine.get_all_items_from_minio(obj_type)
+        links_batch = []
+        for item in items:
+            from_id = str(item.get("id"))
+            rels = item.get("_zibridge_links", {})
+            for target_type, ids in rels.items():
+                for t_id in ids:
+                    links_batch.append({"from_id": from_id, "to_id": str(t_id), "to_type": target_type})
+        
+        if links_batch:
+            graph_mgr.link_entities_batch(project_id, obj_type, links_batch)
+            console.print(f"🕸️ Graphe : {len(links_batch)} liens créés pour {obj_type}")
+
+@app.command()
+def health_check(project_id: int):
+    """Vérifie la santé des données via Neo4j."""
+    from src.core.graph import GraphManager
+    gm = GraphManager()
+    console.print(f"[bold blue]🩺 Analyse de santé pour le projet {project_id}...[/bold blue]")
     
-    try:
-        restore_engine = RestoreEngine(snapshot_id=snap_id)
-        
-        if selective:
-            # Mode sélectif : restaure uniquement les changements
-            report = restore_engine.run_smart_restore_selective(skip_checks=skip_checks)
-        else:
-            # Mode complet : restaure tout
-            report = restore_engine.run_smart_restore(skip_checks=skip_checks)
-        
-        console.print(f"\n[bold green]🎉 Restauration Intelligente terminée ![/bold green]")
-        
-        if selective and 'skipped' in report:
-            console.print(f"""
-[bold]Résumé :[/bold]
-✅ Succès : {report.get('success', 0)}
-✨ Ressuscités : {report.get('resurrected', 0)}
-🔀 Fusionnés : {report.get('merged', 0)}
-😴 Ignorés (identiques) : {report.get('skipped', 0)}
-⚠️ Alertes : {report.get('warnings', 0)}
-❌ Échecs : {report.get('failed', 0)}
-            """)
-        else:
-            console.print(f"""
-[bold]Résumé :[/bold]
-✅ Succès : {report.get('success', 0)}
-✨ Ressuscités : {report.get('resurrected', 0)}
-🔀 Fusionnés : {report.get('merged', 0)}
-⚠️ Alertes : {report.get('warnings', 0)}
-❌ Échecs : {report.get('failed', 0)}
-            """)
-        
-    except Exception as e:
-        console.print(f"[bold red]❌ Erreur critique : {e}[/bold red]")
-        import traceback
-        console.print(traceback.format_exc())
+    orphans = gm.get_orphan_entities(project_id, "contacts", "companies")
+    if orphans:
+        console.print(f"[bold red]❌ {len(orphans)} Contacts Orphelins détectés ![/bold red]")
+        for o_id in orphans[:10]: console.print(f"  - Contact ID: {o_id}")
+    else:
+        console.print("[bold green]✅ Aucun contact orphelin. Toutes les sutures sont OK.[/bold green]")
 
 if __name__ == "__main__":
     app()

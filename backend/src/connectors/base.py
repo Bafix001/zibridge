@@ -1,55 +1,56 @@
 from abc import ABC, abstractmethod
 from typing import Generator, Any, Optional, Tuple, Dict, List
+from loguru import logger
 
 class BaseConnector(ABC):
-    """
-    Interface Abstraite Universelle Zibridge.
-    Permet l'interopérabilité entre APIs (SaaS) et Fichiers (CSV, Excel).
-    """
+    def __init__(
+        self,
+        credentials: Dict[str, Any],
+        project_config: Optional[Dict[str, Any]] = None,
+        project_id: Optional[int] = None
+    ):
+        self.credentials = credentials
+        self.project_config = project_config or {}
+        self.project_id = project_id
+        self.batch_size = 100
+
+        logger.debug(
+            f"🧠 BaseConnector initialisé | project_id={self.project_id}"
+        )
+
 
     @abstractmethod
-    def test_connection(self) -> bool:
-        """Vérifie l'accès à la source (API Key ou existence du fichier)."""
+    def get_available_object_types(self) -> List[str]:
+        """
+        Découverte dynamique : Retourne la liste de TOUS les types d'objets 
+        disponibles dans le CRM (Contacts, Deals, Tickets, CustomObj, etc.)
+        """
         pass
 
     @abstractmethod
     def extract_data(self, object_type: str) -> Generator[Dict[str, Any], None, None]:
-        """
-        Extrait les données. 
-        Chaque dictionnaire retourné DOIT contenir une clé 'id' universelle.
-        """
+        """Extrait n'importe quel type d'objet en streaming."""
+        pass
+    
+    @abstractmethod
+    def batch_push_upsert(self, object_type: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Push massif agnostique."""
         pass
 
     @abstractmethod
-    def push_update(self, object_type: str, external_id: str, data: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    def batch_create_associations(self, associations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Envoie les modifications. 
-        Pour un CSV, cela pourrait signifier réécrire une ligne.
+        Format universel : [{'from_id': '..', 'to_id': '..', 'from_type': '..', 'to_type': '..'}]
         """
         pass
-
-    @abstractmethod
-    def get_association_definition(self, from_type: str, to_type: str) -> Any:
-        """Traduit une relation logique en identifiant technique source."""
-        pass
-
-    @abstractmethod
-    def create_association(self, from_type: str, from_id: str, to_type: str, to_id: str, assoc_type_id: Any) -> bool:
-        """Établit le lien entre deux entités."""
-        pass
-
-    # --- NOUVELLES MÉTHODES POUR L'AGNOSTICISME ---
-
-    def normalize_data(self, raw_item: Dict[str, Any], object_type: str) -> Dict[str, Any]:
-        """
-        Optionnel : Transforme les clés propriétaires (ex: 'FirstName') 
-        en clés standard Zibridge (ex: 'firstname').
-        Par défaut, retourne la donnée brute.
-        """
-        return raw_item
 
     @property
     @abstractmethod
     def source_type(self) -> str:
-        """Retourne le type de source : 'api', 'file', 'database'."""
         pass
+
+    def _extract_id(self, item: Dict[str, Any], object_type: str) -> str:
+        """Tente d'extraire l'ID de manière intelligente peu importe l'objet."""
+        for key in ["id", f"{object_type}_id", "hs_object_id", "object_id"]:
+            if item.get(key): return str(item[key])
+        return "UNKNOWN"

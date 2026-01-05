@@ -1,134 +1,226 @@
-import time
 from typing import List, Optional, Dict, Any
 from loguru import logger
-from sqlmodel import Session, select
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.prompt import Confirm
-
-from src.connectors.base import BaseConnector
-from src.core.snapshot import SnapshotEngine
-from src.core.graph import GraphManager
-from src.core.models import IdMapping, Snapshot
+from sqlmodel import Session
+from src.core.models import SnapshotProject, IdMapping
 from src.utils.db import engine
+from src.core.snapshot import SnapshotEngine
+from src.core.hashing import calculate_content_hash
+from src.core.graph import GraphManager
+from rich.console import Console
 
 console = Console()
 
 class RestoreEngine:
-    def __init__(self, snapshot_id: int, connector: BaseConnector, dry_run: bool = False):
+    def __init__(self, project_id: int, connector: Any, snapshot_id: Optional[int] = None, dry_run: bool = False):
+        self.project_id = project_id
         self.snapshot_id = snapshot_id
         self.connector = connector
         self.dry_run = dry_run
-        self.snap_engine = SnapshotEngine(snapshot_id=snapshot_id)
         self.graph = GraphManager()
-        self.id_mapping = {}
-
-        if self.dry_run:
-            console.print(Panel(
-                f"[bold magenta]🧪 MODE SIMULATION (DRY-RUN) ACTIVÉ[/bold magenta]\n"
-                f"Connecteur : [white]{type(self.connector).__name__}[/white] | Source : [cyan]{self.connector.source_type}[/cyan]",
-                border_style="magenta"
-            ))
-
-    def _apply_rate_limit(self):
-        """⏳ Applique un délai uniquement pour les sources de type API."""
-        if not self.dry_run and self.connector.source_type == "api":
-            time.sleep(0.2)
-
-    def _get_display_name(self, object_type: str, item: Dict[str, Any]) -> str:
-        """Récupère un nom lisible de manière agnostique (plat ou imbriqué)."""
-        # On fusionne properties et racine pour chercher les clés de nommage
-        props = item.get("properties", item)
-        name_keys = ["name", "subject", "label", "title", "lastname", "email", "full_name"]
         
-        for key in name_keys:
-            if props.get(key): return str(props[key])
-        return f"{object_type} #{item.get('id', 'unknown')}"
-
-    def push_data(self, object_type: str, item_id: str, snapshot_item: Dict[str, Any], prop_filter: List[str] = None):
-        """Pousse les données en respectant le schéma de la source (API ou Fichier)."""
+        if snapshot_id:
+            self.snap_engine = SnapshotEngine(snapshot_id=snapshot_id)
         
-        # 1. Extraction intelligente des données (Gère HubSpot 'properties' vs CSV 'flat')
-        full_data = snapshot_item.get("properties", snapshot_item)
-        
-        # 2. Filtrage chirurgical
-        if prop_filter:
-            clean_data = {k: v for k, v in full_data.items() if k in prop_filter}
-        else:
-            # On retire les métadonnées internes Zibridge avant le push
-            clean_data = {k: v for k, v in full_data.items() if not k.startswith("_zibridge")}
+        with Session(engine) as session:
+            self.project = session.get(SnapshotProject, project_id)
 
-        if self.dry_run:
-            logger.info(f"🧪 [SIMUL] {self.connector.source_type.upper()} Push -> {object_type}/{item_id}")
-            return "updated", item_id
+    def run(self) -> Dict[str, int]:
+        """🚀 Restauration batch optimisée : Création, Batch Update et Suture."""
+        report = {"success": 0, "failed": 0, "ignored": 0, "updates": 0, "sutures": 0,
+                  "to_create": 0, "to_update": 0, "to_suture": 0}
+        id_translation_map = {}
+        all_pending_links = []
 
-        self._apply_rate_limit()
-        
-        # 3. Le connecteur décide comment 'pousser' (Update API ou écriture ligne CSV)
-        # On envoie la donnée 'propre' au connecteur
-        return self.connector.push_update(object_type, item_id, clean_data)
-
-    def _restore_associations(self, object_type: str, old_id: str, current_id: str, item_data: Dict[str, Any]):
-        """Suture universelle des liens."""
-        if self.dry_run: return
-
-        # On privilégie les liens stockés dans le JSON (plus fiable pour les fichiers)
-        relations = item_data.get("_zibridge_links", {})
-        if not relations:
-            relations = self.graph.get_entity_relations(object_type, old_id, self.snapshot_id)
-
-        for rel_type, rel_ids in relations.items():
-            target_ids = rel_ids if isinstance(rel_ids, list) else [rel_ids]
-            for o_rel_id in target_ids:
-                # Mapping dynamique (si l'objet lié a changé d'ID pendant cette session)
-                actual_rel_id = self.id_mapping.get(f"{rel_type}/{o_rel_id}", o_rel_id)
-                
-                assoc_def = self.connector.get_association_definition(object_type, rel_type)
-                
-                if assoc_def:
-                    self.connector.create_association(
-                        from_type=object_type, from_id=current_id,
-                        to_type=rel_type, to_id=actual_rel_id,
-                        assoc_type_id=assoc_def
-                    )
-
-    def run_smart_restore(self, selected_props: List[str] = None, skip_checks: bool = False):
-        """Cycle de restauration universel."""
-        # On pourrait définir l'ordre de priorité dans le connecteur
-        priority_order = ["companies", "contacts", "deals", "tickets"]
-        report = {"success": 0, "failed": 0, "resurrected": 0, "merged": 0}
+        priority_order = self.graph.get_restoration_order(self.project_id)
+        if not priority_order:
+            priority_order = self.connector.get_available_object_types()
 
         for obj_type in priority_order:
-            console.rule(f"[bold]{obj_type.upper()}[/bold]")
-            items = self.snap_engine.get_all_items_from_minio(obj_type)
-            
-            for item in items:
-                ext_id = str(item.get("id"))
-                name = self._get_display_name(obj_type, item)
+            logger.info(f"⚡ Analyse chirurgicale : {obj_type}")
 
-                # Push & Suture
-                status, new_id = self.push_data(obj_type, ext_id, item, prop_filter=selected_props)
-                target_id = new_id if new_id else ext_id
+            # Récupère tous les items du snapshot
+            try:
+                target_items = self.snap_engine.get_all_items(obj_type)
+            except AttributeError:
+                logger.warning(f"⚠️ SnapshotEngine n'a pas get_all_items, on skip {obj_type}")
+                continue
 
-                if status in ["updated", "resurrected", "merged"]:
-                    if status != "updated" and not self.dry_run:
-                        self._save_id_mapping(obj_type, ext_id, target_id)
-                    
-                    self._restore_associations(obj_type, ext_id, target_id, item)
-                    report[status if status != "updated" else "success"] += 1
+            if not target_items:
+                continue
+
+            # État actuel depuis le connecteur
+            current_items = {str(item['id']): item for item in self.connector.extract_data(obj_type)}
+
+            to_create_props, to_create_old_ids = [], []
+            to_update_batch = []
+
+            for target_item in target_items:
+                old_id = str(target_item.get("id"))
+                current_item = current_items.get(old_id)
+
+                target_props = target_item.get("properties", target_item)
+                target_hash = calculate_content_hash(target_item)
+
+                # --- Création ou Update ---
+                if not current_item:
+                    to_create_props.append(target_props)
+                    to_create_old_ids.append(old_id)
+                    report["to_create"] += 1
                 else:
-                    report["failed"] += 1
+                    actual_crm_id = str(current_item['id'])
+                    id_translation_map[old_id] = actual_crm_id
+                    current_hash = calculate_content_hash(current_item)
+                    if current_hash != target_hash:
+                        to_update_batch.append({"id": actual_crm_id, "properties": target_props})
+                        report["to_update"] += 1
+                    else:
+                        report["ignored"] += 1
+
+                # --- Collecte des liens pour suture ---
+                snap_links = target_item.get("_zibridge_links", [])
+                current_links = current_item.get("_zibridge_links", []) if current_item else []
+
+                normalized_snap_links = [
+                    l if isinstance(l, dict) and "id" in l and "type" in l else {"id": l, "type": "unknown"}
+                    for l in snap_links
+                ]
+                normalized_current_links = [
+                    l if isinstance(l, dict) and "id" in l and "type" in l else {"id": l, "type": "unknown"}
+                    for l in current_links
+                ]
+
+                existing_link_keys = {f"{l['type']}:{l['id']}" for l in normalized_current_links}
+
+                for link in normalized_snap_links:
+                    link_key = f"{link['type']}:{link['id']}"
+                    if link_key not in existing_link_keys:
+                        all_pending_links.append({
+                            "source_type": obj_type,
+                            "source_old_id": old_id,
+                            "target_type": link["type"],
+                            "target_old_id": str(link["id"])
+                        })
+                        report["to_suture"] += 1
+
+            # --- Batch Creation ---
+            if to_create_props and not self.dry_run:
+                new_objects = self.connector.batch_push_upsert(obj_type, to_create_props)
+                for i, new_obj in enumerate(new_objects):
+                    o_id = to_create_old_ids[i]
+                    n_id = str(new_obj["id"])
+                    id_translation_map[o_id] = n_id
+                    self._save_id_mapping(obj_type, o_id, n_id)
+                report["success"] += len(new_objects)
+
+            # --- Batch Update (HubSpot Mode) ---
+            if to_update_batch and not self.dry_run:
+                for i in range(0, len(to_update_batch), 100):
+                    chunk = to_update_batch[i:i+100]
+                    try:
+                        self.connector.batch_update(obj_type, chunk)  # HubSpot : batch 100 max
+                    except AttributeError:
+                        # fallback si batch_update non implémenté
+                        for item in chunk:
+                            self.connector.push_update(obj_type, item["id"], item["properties"])
+                    except Exception as e:
+                        logger.error(f"❌ Erreur batch update {obj_type}: {e}")
+
+        # --- Suture globale sécurisée ---
+        if not self.dry_run and all_pending_links:
+            logger.info(f"🔗 Suture de {len(all_pending_links)} relations...")
+            self._execute_translated_suture_batch_safe(all_pending_links, id_translation_map)
+            report["sutures"] = len(all_pending_links)
 
         return report
 
-    def _save_id_mapping(self, obj_type, old_id, new_id):
-        self.id_mapping[f"{obj_type}/{old_id}"] = new_id
+    def _save_id_mapping(self, obj_type: str, old_id: str, new_id: str):
         with Session(engine) as session:
-            session.add(IdMapping(
-                snapshot_id=self.snapshot_id, 
-                object_type=obj_type, 
-                old_id=old_id, 
+            mapping = IdMapping(
+                project_id=self.project_id,
+                object_type=obj_type,
+                source_system=self.connector.source_type,
+                old_id=old_id,
                 new_id=new_id
-            ))
+            )
+            session.add(mapping)
             session.commit()
+
+    def _execute_translated_suture_batch_safe(self, pending_links: List[Dict], translation_map: Dict):
+        batches = {}
+        for link in pending_links:
+            real_source_id = translation_map.get(link["source_old_id"], link["source_old_id"])
+            real_target_id = translation_map.get(link["target_old_id"], link["target_old_id"])
+            key = (link["source_type"], link["target_type"])
+            # ⚡ Ajout des types pour que HubSpot ait from_type/to_type
+            batches.setdefault(key, []).append({
+                "from_type": link["source_type"],
+                "from_id": real_source_id,
+                "to_type": link["target_type"],
+                "to_id": real_target_id
+            })
+
+        for (s_type, t_type), associations in batches.items():
+            for i in range(0, len(associations), 100):
+                chunk = associations[i:i+100]
+                try:
+                    self.connector.batch_create_associations(chunk)
+                except Exception as e:
+                    logger.error(f"❌ Erreur lors de la suture batch {s_type}->{t_type} : {e}")
+
+    def get_preflight_report(self) -> Dict[str, int]:
+        """Analyse d'impact avant exécution (simulation)."""
+        report = {"to_create": 0, "to_update": 0, "to_suture": 0, "ignored": 0}
+        if not hasattr(self, "snap_engine"):
+            return report
+
+        priority_order = self.graph.get_restoration_order(self.project_id)
+        if not priority_order:
+            priority_order = self.connector.get_available_object_types()
+
+        for obj_type in priority_order:
+            try:
+                target_items = self.snap_engine.get_all_items(obj_type)
+            except AttributeError:
+                continue
+            current_items = {str(item['id']): item for item in self.connector.extract_data(obj_type)}
+
+            for target_item in target_items:
+                old_id = str(target_item.get("id"))
+                current_item = current_items.get(old_id)
+                target_hash = calculate_content_hash(target_item)
+
+                if not current_item:
+                    report["to_create"] += 1
+                else:
+                    current_hash = calculate_content_hash(current_item)
+                    if current_hash != target_hash:
+                        report["to_update"] += 1
+                    else:
+                        report["ignored"] += 1
+
+                snap_links = target_item.get("_zibridge_links", [])
+                current_links = current_item.get("_zibridge_links", []) if current_item else []
+
+                normalized_snap_links = [
+                    l if isinstance(l, dict) and "id" in l and "type" in l else {"id": l, "type": "unknown"}
+                    for l in snap_links
+                ]
+                normalized_current_links = [
+                    l if isinstance(l, dict) and "id" in l and "type" in l else {"id": l, "type": "unknown"}
+                    for l in current_links
+                ]
+
+                existing_link_keys = {f"{l['type']}:{l['id']}" for l in normalized_current_links}
+                for link in normalized_snap_links:
+                    link_key = f"{link['type']}:{link['id']}"
+                    if link_key not in existing_link_keys:
+                        report["to_suture"] += 1
+
+        return report
+
+    def display_preflight(self, analysis: Dict[str, int]):
+        console.print("\n🔍 Analyse préflight :")
+        console.print(f"⚡ À créer : {analysis['to_create']}")
+        console.print(f"📝 À mettre à jour : {analysis['to_update']}")
+        console.print(f"🔗 À suture : {analysis['to_suture']}")
+        console.print(f"😴 Ignorés : {analysis['ignored']}")

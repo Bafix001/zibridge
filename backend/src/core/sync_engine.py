@@ -1,133 +1,132 @@
 from loguru import logger
-from sqlmodel import Session
+from sqlmodel import Session, select
 from src.utils.db import engine
 from src.connectors.factory import ConnectorFactory
 from src.core.snapshot import SnapshotEngine
-from src.core.models import Snapshot
+from src.core.models import Snapshot, Branch
 from src.core.graph import GraphManager
-from typing import Dict
+from typing import Dict, List, Optional
 
-def run_universal_sync(crm_type: str, credentials: dict):
+def run_universal_sync(crm_type: str, credentials: dict, branch_id: Optional[int] = None):
     """
-    🔥 VERSION AGNOSTIQUE TOTALE : détecte + sync TOUS les types automatiquement
+    🚀 MOTEUR DE RÉSILIENCE ZIBRIDGE (Orchestrateur).
+    Traite le CRM comme un repo Git : Discovery -> Extraction -> Hashing -> Graph Mapping.
     """
     snap_id = None
     success = False
     total_count = 0
+    BATCH_SIZE = 500 
+    project_id = credentials.get("project_id")
+    final_stats = {}
     
     try:
-        # 1. Instanciation dynamique via la Factory
+        # 1. Initialisation du connecteur agnostique
         connector = ConnectorFactory.get_connector(crm_type, credentials)
-        crm_name = type(connector).__name__.replace("Connector", "")
+        source_name = credentials.get("provider_name", crm_type)
         
-        # ✅ 2. AUTO-DÉTECTION DES TYPES
-        entity_types = connector.get_detected_entities()
-        detected_types = list(set(entity_types.values()))  # ['company', 'contact', 'custom_0']
-        logger.info(f"🔍 DÉTECTÉ {len(detected_types)} types: {detected_types}")
+        # 2. DÉCOUVERTE DYNAMIQUE (Elon Mode)
+        # On ne liste plus 'contacts/companies' en dur, on demande au CRM ce qu'il a.
+        detected_types = connector.get_available_object_types()
+        logger.info(f"🛰️ Types détectés pour {source_name}: {detected_types}")
 
-        # ✅ 3. FIX source_name : récupère provider_name OU fallback
-        source_name = credentials.get("provider_name", f"{crm_name}_File")
-
-        # 4. Initialisation du Snapshot en base SQL (DYNAMIQUE + FIX)
-        with Session(engine) as session:
-            new_snap = Snapshot(
+        # 3. CRÉATION DU COMMIT (Snapshot)
+        snap_id = create_snapshot(
             source_name=source_name,
             source_type=connector.source_type,
-            status="running",
-            detected_entities={etype: connector.count_entities(etype) for etype in detected_types},
-            companies_count=0,
-            contacts_count=0,
-            deals_count=0,
-            tickets_count=0,
-            project_id=credentials.get("project_id"),  # 🔥 LA LIGNE QUI MANQUAIT
-
-
-            sync_config={
-            "crm_type": crm_type,
-            "provider_name": source_name,
-            "source_type": connector.source_type,
-            # On NE stocke PAS les credentials sensibles (tokens, passwords)
-            # Seulement les métadonnées pour identifier la source
-        }
+            project_id=project_id,
+            branch_id=branch_id,
+            crm_type=crm_type
         )
+
+        # 4. INITIALISATION DES MOTEURS
+        snapshot_engine = SnapshotEngine(snapshot_id=snap_id)
         
-            logger.info(f"📌 Snapshot attaché au projet ID = {credentials.get('project_id')}")
-
-
-            session.add(new_snap)
-            session.commit()
-            session.refresh(new_snap)
-            snap_id = new_snap.id
-
-        logger.info(f"🚀 DÉMARRAGE SYNC AGNOSTIQUE | Snap #{snap_id} | Source: {source_name} | Types: {detected_types}")
-
-        # 5. Préparation des moteurs
-        engine_snap = SnapshotEngine(snapshot_id=snap_id)
-        graph_mgr = GraphManager()
-        
-        # ✅ 6. BOUCLE SUR TOUS LES TYPES DÉTECTÉS
+        # 5. EXTRACTION & VERSIONNING (Streaming)
         for entity_type in detected_types:
-            count = 0
-            logger.info(f"📥 Extraction {entity_type}s...")
-            
-            # Extraction des objets de CE TYPE
-            for raw_item in connector.extract_entities(entity_type):
-                ext_id = str(raw_item.get("id"))
-                rels = raw_item.get("_zibridge_links", {}) 
-                
-                # Sauvegarde MinIO + Postgres
-                engine_snap.process_item(
-                    connector=connector,
-                    object_type=f"{entity_type}s",  # companies, contacts, custom_0s
-                    external_id=ext_id,
-                    raw_data=raw_item,
-                    associations=rels
-                )
-                
-                # Suture Automatique du Graphe Neo4j
-                for rel_type, target_ids in rels.items():
-                    targets = target_ids if isinstance(target_ids, list) else [target_ids]
-                    for t_id in targets:
-                        graph_mgr.link_entities(
-                            from_id=ext_id, from_type=f"{entity_type}s",
-                            to_id=str(t_id), to_type=rel_type,
-                            relation_name=f"REL_{entity_type}_TO_{rel_type}"
-                        )
-                
-                count += 1
-            
-            # ✅ UPDATE COMPTEURS STANDARDS (mapping dynamique)
-            if entity_type == "company":
-                new_snap.companies_count = count
-            elif entity_type == "contact":
-                new_snap.contacts_count = count
-            elif entity_type == "deal":
-                new_snap.deals_count = count
-            elif entity_type == "ticket":
-                new_snap.tickets_count = count
-            
-            logger.success(f"✅ {entity_type}s synchronisés : {count}")
+            count = sync_entity_type(
+                connector=connector,
+                entity_type=entity_type,
+                snapshot_engine=snapshot_engine,
+                batch_size=BATCH_SIZE
+            )
+            final_stats[entity_type] = count
             total_count += count
         
+        # 6. FINALISATION GÉOMÉTRIQUE
+        # Calcule le Merkle Root global et ferme le snapshot
+        snapshot_engine.finalize_snapshot()
         success = True
 
     except Exception as e:
-        logger.error(f"❌ Erreur critique lors de la synchronisation universelle : {e}")
+        logger.error(f"❌ Erreur critique lors de la synchro: {e}", exc_info=True)
         success = False
 
     finally:
-        # 7. Fermeture et mise à jour du statut final
         if snap_id:
-            with Session(engine) as session:
-                db_snap = session.get(Snapshot, snap_id)
-                if db_snap:
-                    db_snap.status = "completed" if success else "failed"
-                    db_snap.total_objects = total_count
-                    session.add(db_snap)
-                    session.commit()
-            
-            status_label = "SUCCÈS" if success else "ÉCHEC"
-            logger.info(f"🏁 FIN DE SYNCHRO : {status_label} ({total_count} items total)")
+            finalize_db_record(snap_id, branch_id, success, total_count, final_stats)
+    
+    return snap_id, success, total_count
 
-if __name__ == "__main__":
-    pass
+
+def create_snapshot(source_name: str, source_type: str, project_id: int, 
+                   branch_id: Optional[int], crm_type: str) -> int:
+    """Initialise le snapshot dans PostgreSQL."""
+    with Session(engine) as session:
+        snapshot = Snapshot(
+            source_name=source_name,
+            source_type=source_type,
+            status="running",
+            project_id=project_id,
+            branch_id=branch_id,
+            sync_config={"crm_type": crm_type}
+        )
+        session.add(snapshot)
+        session.commit()
+        session.refresh(snapshot)
+        return snapshot.id
+
+
+def sync_entity_type(connector, entity_type: str, snapshot_engine, batch_size: int) -> int:
+    """Aspire un type d'objet et ses relations en Single-Pass."""
+    count = 0
+    
+    # On utilise extract_entities qui normalise déjà les données et IDs
+    for item in connector.extract_entities(entity_type):
+        entity_id = str(item.get("id"))
+        links = item.get("_zibridge_links", [])
+        
+        # SnapshotEngine s'occupe de : Hashing + Blob Storage + Graph Mapping
+        snapshot_engine.process_item(
+            connector=connector,
+            object_type=entity_type,
+            external_id=entity_id,
+            raw_data=item,
+            associations=links
+        )
+        count += 1
+        
+        # Le flush interne du SnapshotEngine gère les paquets de 500
+    
+    logger.info(f"✅ Terminé : {count} {entity_type} versionnés.")
+    return count
+
+
+def finalize_db_record(snap_id: int, branch_id: Optional[int], success: bool, total: int, stats: Dict[str, int]):
+    """Met à jour les métadonnées finales et le pointeur HEAD de la branche."""
+    with Session(engine) as session:
+        snapshot = session.get(Snapshot, snap_id)
+        if snapshot:
+            snapshot.status = "completed" if success else "failed"
+            snapshot.total_objects = total
+            snapshot.stats = stats # Stockage JSON agnostique des compteurs
+            
+            session.add(snapshot)
+            
+            # 🔥 GIT LOGIC: HEAD Update
+            if success and branch_id:
+                branch = session.get(Branch, branch_id)
+                if branch:
+                    branch.current_snapshot_id = snap_id
+                    session.add(branch)
+            
+            session.commit()

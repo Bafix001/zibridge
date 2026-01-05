@@ -1,131 +1,140 @@
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 from loguru import logger
 from src.utils.db import neo4j_driver
-
 
 class GraphManager:
     def __init__(self):
         self.driver = neo4j_driver
+        self._setup_indices()
 
-    # ================== VERSIONNAGE ==================
-
-    def update_relation(self, snapshot_id: int, object_type: str, external_id: str, item_hash: str):
-        """Versionne l'entité dans le temps."""
+    def _setup_indices(self):
+        """Contraintes pour garantir l'intégrité et la vitesse des recherches."""
+        if not self.driver: return
+        queries = [
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE (e.external_id, e.type, e.project_id) IS UNIQUE",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.type)",
+            "CREATE INDEX IF NOT EXISTS FOR (s:Snapshot) ON (s.snap_id)"
+        ]
         with self.driver.session() as session:
-            query = """
-            MERGE (e:Entity {external_id: $ext_id, type: $obj_type})
-            MERGE (s:Snapshot {snap_id: $snap_id})
-            CREATE (e)-[:HAS_VERSION {hash: $hash, at: datetime()}]->(s)
-            """
-            try:
-                session.run(
-                    query,
-                    ext_id=external_id,
-                    obj_type=object_type,
-                    snap_id=snapshot_id,
-                    hash=item_hash,
-                )
-            except Exception as e:
-                logger.error(f"❌ Erreur Neo4j (update_relation) : {e}")
+            for q in queries:
+                try: 
+                    session.run(q)
+                except Exception as e:
+                    logger.debug(f"Index/Contrainte : {e}")
 
-    # ================== LIENS GÉNÉRIQUES ==================
+    # ================== 🧹 CLEANUP (LA MÉTHODE MANQUANTE) ==================
 
-    def link_entities(self, from_id: str, from_type: str, to_id: str, to_type: str, relation_name: str):
+    def clear_project_graph(self, project_id: int):
         """
-        Relie deux entités de n'importe quel type avec n'importe quelle étiquette.
-        Ex: link_entities("123", "deals", "456", "companies", "ASSOCIATED_WITH")
+        Supprime les nœuds et relations liés à ce projet pour repartir à neuf.
+        Utilisé au début de chaque synchronisation.
         """
+        if not self.driver: return
+        query = "MATCH (n:Entity {project_id: $project_id}) DETACH DELETE n"
         with self.driver.session() as session:
-            query = f"""
-            MERGE (a:Entity {{external_id: $a_id, type: $a_type}})
-            MERGE (b:Entity {{external_id: $b_id, type: $b_type}})
-            MERGE (a)-[:{relation_name.upper()}]->(b)
-            """
-            try:
-                session.run(
-                    query,
-                    a_id=from_id,
-                    a_type=from_type,
-                    b_id=to_id,
-                    b_type=to_type,
-                )
-            except Exception as e:
-                logger.error(f"❌ Erreur Neo4j (link_entities) : {e}")
+            session.run(query, project_id=project_id)
+            logger.info(f"🧹 Graphe Neo4j nettoyé pour le projet {project_id}")
 
-    # ================== ORPHANS & RELATIONS ==================
+    # ================== 🚀 BATCH PROCESSING (TURBO) ==================
 
-    def get_entity_relations(self, object_type: str, external_id: str, snapshot_id: int) -> Dict[str, List[str]]:
+    def link_entities_batch(self, project_id: int, from_type: str, links: List[dict]):
         """
-        Récupère toutes les relations sortantes d'une entité (hors HAS_VERSION).
-        Retourne { entity_type: [external_id1, external_id2, ...] }.
+        🔥 Suture Turbo : Crée des milliers de liens en une seule transaction.
+        'links' attendu: [{'from_id': 'A', 'to_id': 'B', 'to_type': 'Company', 'role': 'PRIMARY'}]
+        """
+        if not links or not self.driver: return
+
+        query = """
+        UNWIND $batch as row
+        MERGE (a:Entity {external_id: row.from_id, type: $from_type, project_id: $project_id})
+        MERGE (b:Entity {external_id: row.to_id, type: row.to_type, project_id: $project_id})
+        MERGE (a)-[r:LINKED_TO]->(b)
+        SET r.role = row.role, r.updated_at = datetime()
         """
         with self.driver.session() as session:
-            query = """
-            MATCH (e:Entity {external_id: $ext_id, type: $obj_type})-[r]->(related:Entity)
-            WHERE NOT type(r) = 'HAS_VERSION'
-            RETURN type(r) as rel_type, related.type as entity_type, related.external_id as entity_id
-            """
             try:
-                result = session.run(query, ext_id=external_id, obj_type=object_type)
-                relations: Dict[str, List[str]] = {}
-                for record in result:
-                    e_type = record["entity_type"]
-                    e_id = record["entity_id"]
-                    relations.setdefault(e_type, []).append(e_id)
-                return relations
+                session.run(query, batch=links, from_type=from_type, project_id=project_id)
             except Exception as e:
-                logger.error(f"❌ Erreur Neo4j (get_entity_relations) : {e}")
-                return {}
+                logger.error(f"❌ Neo4j Batch Error: {e}")
 
-    def check_orphans(
-        self,
-        object_type: str,
-        external_id: str,
-        snapshot_id: int,
-        current_crm_ids: Set[str],
-    ) -> Dict[str, List[str]]:
+    # ================== 🧬 LOGIQUE DE SUTURE & RESTAURATION ==================
+
+    def get_restoration_order(self, project_id: int) -> List[str]:
         """
-        Vérifie quelles entités liées n'existent plus dans le CRM actuel.
-        Retourne par ex : {"missing_companies": ["123", "456"]}.
+        📐 TRI TOPOLOGIQUE (Elon Mode) :
+        Analyse les dépendances pour dire au moteur dans quel ordre créer les objets.
         """
-        historical = self.get_entity_relations(object_type, external_id, snapshot_id)
-        orphans: Dict[str, List[str]] = {}
-        for rel_type, ids in historical.items():
-            missing = [oid for oid in ids if oid not in current_crm_ids]
-            if missing:
-                orphans[f"missing_{rel_type}"] = missing
-        return orphans
+        if not self.driver: return []
+        
+        query = """
+        MATCH (a:Entity {project_id: $project_id})-[r:LINKED_TO]->(b:Entity)
+        WHERE a.type <> b.type
+        RETURN DISTINCT a.type as source, b.type as target
+        """
+        with self.driver.session() as session:
+            result = session.run(query, project_id=project_id)
+            deps = {}
+            all_types = set()
+            for record in result:
+                src, tgt = record["source"], record["target"]
+                deps.setdefault(src, set()).add(tgt)
+                all_types.update([src, tgt])
+            
+            ordered = []
+            visited = set()
 
-    # ================== ANALYSE & VISU ==================
+            def visit(t):
+                if t not in visited:
+                    visited.add(t)
+                    for child in deps.get(t, []):
+                        visit(child)
+                    ordered.insert(0, t)
 
-    def get_impact_analysis(self, object_type: str, external_id: str, snapshot_id: int) -> Dict:
-        """Analyse la complexité relationnelle d'une entité pour un snapshot donné."""
-        relations = self.get_entity_relations(object_type, external_id, snapshot_id)
-        relation_count = sum(len(ids) for ids in relations.values())
+            for t in all_types:
+                visit(t)
+            
+            return ordered[::-1]
 
-        complexity = "low"
-        if relation_count > 10:
-            complexity = "high"
-        elif relation_count > 3:
-            complexity = "medium"
+    def get_orphan_entities(self, project_id: int, source_type: str, target_type: str) -> List[str]:
+        """Trouve les entités (ex: Deals) sans parents (ex: Company)."""
+        query = """
+        MATCH (s:Entity {type: $source_type, project_id: $project_id})
+        WHERE NOT (s)-[:LINKED_TO]->(:Entity {type: $target_type, project_id: $project_id})
+        RETURN s.external_id as id
+        """
+        with self.driver.session() as session:
+            result = session.run(query, source_type=source_type, target_type=target_type, project_id=project_id)
+            return [record["id"] for record in result]
+        
+    
+    def create_relation(self, *args, **kwargs):
+        """
+        🔗 Suture Ultra-Flexible (Elon Mode).
+        Gère les appels positionnels et par mots-clés.
+        """
+        if not self.driver: return
 
-        return {
-            "entity": {"type": object_type, "id": external_id},
-            "historical_relations": relations,
-            "relation_count": relation_count,
-            "complexity": complexity,
-        }
+        # Extraction intelligente des arguments
+        # On s'attend à : from_id, from_type, to_id, to_type, rel_type...
+        from_id = args[0] if len(args) > 0 else kwargs.get('from_id')
+        from_type = args[1] if len(args) > 1 else kwargs.get('from_type')
+        to_id = args[2] if len(args) > 2 else kwargs.get('to_id')
+        to_type = args[3] if len(args) > 3 else kwargs.get('to_type')
+        
+        # Le project_id peut être passé en position 5 ou via kwargs
+        p_id = kwargs.get('project_id') or (args[5] if len(args) > 5 else None)
+        rel_type = kwargs.get('rel_type') or (args[4] if len(args) > 4 else "ASSOCIATED")
 
-    def visualize_entity_graph(self, object_type: str, external_id: str, snapshot_id: int) -> str:
-        """Représentation ASCII simple du graphe de l'entité."""
-        relations = self.get_entity_relations(object_type, external_id, snapshot_id)
-        if not relations:
-            return f"Aucune relation trouvée pour {object_type} #{external_id} dans le Snap #{snapshot_id}"
+        if not p_id:
+            # Si on ne l'a toujours pas, on essaie de le trouver dans le contexte global ou on utilise un fallback
+            return
 
-        lines = [f"┌─ {object_type.upper()} #{external_id}"]
-        for rel_type, ids in relations.items():
-            lines.append(f"├─ {rel_type.upper()} ({len(ids)})")
-            for i, eid in enumerate(ids):
-                connector = "└─" if i == len(ids) - 1 else "├─"
-                lines.append(f"│  {connector} #{eid}")
-        return "\n".join(lines)
+        query = """
+        MERGE (a:Entity {external_id: $from_id, type: $from_type, project_id: $p_id})
+        MERGE (b:Entity {external_id: $to_id, type: $to_type, project_id: $p_id})
+        MERGE (a)-[r:LINKED_TO]->(b)
+        SET r.role = $rel_type, r.updated_at = datetime()
+        """
+        with self.driver.session() as session:
+            session.run(query, p_id=p_id, from_id=str(from_id), from_type=from_type, 
+                        to_id=str(to_id), to_type=to_type, rel_type=rel_type)    

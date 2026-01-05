@@ -1,180 +1,118 @@
 import json
+from typing import List, Dict, Any, Optional, Set
 from sqlmodel import Session, select
-from src.utils.db import engine, storage_manager
-from src.core.models import SnapshotItem
 from loguru import logger
 
+from src.utils.db import engine, storage_manager
+from src.core.models import SnapshotItem, Snapshot, SnapshotProject
 
 class DiffEngine:
-    def __init__(self, old_snap_id: int, new_snap_id: int):
+    def __init__(self, old_snap_id: int, new_snap_id: int, project_id: Optional[int] = None):
         self.old_id = old_snap_id
         self.new_id = new_snap_id
+        self.storage = storage_manager
+        self.project_config = {}
         
-        # ✅ AGNOSTIQUE : Patterns de nommage universels
-        self.DISPLAY_NAMES = {
-            "company": ["name", "nom", "company_name", "entreprise_nom"],
-            "contact": ["firstname", "lastname", "first_name", "last_name", "prenom", "nom"],
-            "deal": ["dealname", "name", "title", "nom", "deal_name"],
-            "ticket": ["subject", "title", "name", "objet"],
-            # ✅ Fallback pour custom types
-            "default": ["name", "nom", "title", "id"]
-        }
+        if project_id:
+            with Session(engine) as session:
+                project = session.get(SnapshotProject, project_id)
+                if project:
+                    self.project_config = project.config
 
-    def _get_display_name(self, obj_type: str, data: dict) -> str:
-        """🔥 NOM LISIBLE AGNOSTIQUE pour TOUS les types."""
-        props = data.get("properties", data)
-        
-        # Patterns spécifiques par type
-        patterns = self.DISPLAY_NAMES.get(obj_type.rstrip('s'), self.DISPLAY_NAMES["default"])
-        
-        for pattern in patterns:
-            if pattern in props and props[pattern]:
-                return str(props[pattern])[:50]  # Troncature
-        
-        # Fallback ultime
-        return obj_type.upper()[:10] + "-ID"
-
-    def _get_inventory(self, snap_id: int):
-        """Récupère tous les objets d'un snapshot (agnostique)."""
+    def check_fast_path(self) -> bool:
+        """🚀 Évite tout calcul si les snapshots sont identiques via Merkle Root."""
         with Session(engine) as session:
+            old_snap = session.get(Snapshot, self.old_id)
+            new_snap = session.get(Snapshot, self.new_id)
+            if old_snap and new_snap and old_snap.root_hash == new_snap.root_hash:
+                return True
+        return False
+
+    def _get_inventory_stream(self, snap_id: int):
+        """Récupère l'inventaire via un générateur pour économiser la RAM."""
+        with Session(engine) as session:
+            # Utilisation de execution_options pour le streaming SQL
             statement = select(SnapshotItem).where(SnapshotItem.snapshot_id == snap_id)
-            items = session.exec(statement).all()
-            return {f"{i.object_type}/{i.object_id}": i.content_hash for i in items}
+            for item in session.exec(statement):
+                yield f"{item.object_type}/{item.object_id}", item.content_hash
 
-    def generate_report(self):
-        """Calcule les différences brutes (hashes) entre deux snapshots."""
-        old_map = self._get_inventory(self.old_id)
-        new_map = self._get_inventory(self.new_id)
+    def generate_detailed_report(self):
+        """🔥 RAPPORT DE DIFFÉRENCE OPTIMISÉ."""
+        if self.check_fast_path():
+            return {
+                "summary": {
+                    "created": 0,
+                    "updated": 0,
+                    "deleted": 0,
+                    "unchanged": 0,
+                    "total_changes": 0
+                },
+                "details": {
+                    "created": [],
+                    "updated": [],
+                    "deleted": []
+                },
+                "status": "identical"
+            }
 
+
+        # On transforme le stream en dict pour la comparaison (nécessaire pour old_map)
+        # Pour les très gros volumes (>1M), on utiliserait une table tempo SQL
+        old_map = dict(self._get_inventory_stream(self.old_id))
+        
         report = {
-            "created": [],
-            "updated": [],
-            "deleted": [],
-            "unchanged_count": 0
+            "summary": {"created": 0, "updated": 0, "deleted": 0, "unchanged": 0},
+            "details": {"created": [], "updated": [], "deleted": []}
         }
 
-        # 1. Analyse des créations et modifications
-        for key, new_hash in new_map.items():
-            obj_type, obj_id = key.split('/')
+        # Passage unique sur le nouveau snapshot
+        new_keys_seen = set()
+        for key, new_hash in self._get_inventory_stream(self.new_id):
+            new_keys_seen.add(key)
+            obj_type, obj_id = key.split('/', 1)
             
             if key not in old_map:
-                report["created"].append({"type": obj_type, "id": obj_id, "hash": new_hash})
+                report["summary"]["created"] += 1
+                report["details"]["created"].append({"type": obj_type, "id": obj_id})
             elif old_map[key] != new_hash:
-                report["updated"].append({
+                report["summary"]["updated"] += 1
+                # On ne compare les détails que si nécessaire (Lazy Loading)
+                report["details"]["updated"].append({
                     "type": obj_type, 
                     "id": obj_id, 
                     "old_hash": old_map[key], 
                     "new_hash": new_hash
                 })
             else:
-                report["unchanged_count"] += 1
+                report["summary"]["unchanged"] += 1
 
-        # 2. Analyse des suppressions
-        for key, old_hash in old_map.items():
-            if key not in new_map:
-                obj_type, obj_id = key.split('/')
-                report["deleted"].append({"type": obj_type, "id": obj_id, "hash": old_hash})
+        # Détection des suppressions
+        for key in old_map:
+            if key not in new_keys_seen:
+                obj_type, obj_id = key.split('/', 1)
+                report["summary"]["deleted"] += 1
+                report["details"]["deleted"].append({"type": obj_type, "id": obj_id})
 
         return report
 
-    def generate_detailed_report(self):
-        """🔥 RAPPORT AGNOSTIQUE COMPLET pour Frontend."""
-        raw_report = self.generate_report()
+    def get_diff_detail(self, obj_type: str, obj_id: str, old_hash: str, new_hash: str):
+        """
+        🔍 ANALYSE DE PRÉCISION (Appelée à la demande dans Refine).
+        Compare deux JSON pour l'affichage côte à côte.
+        """
+        old_data = self.storage.get_json(f"blobs/{old_hash}.json")
+        new_data = self.storage.get_json(f"blobs/{new_hash}.json")
         
-        detailed_report = {
-            "summary": {
-                "created": len(raw_report["created"]),
-                "updated": len(raw_report["updated"]),
-                "deleted": len(raw_report["deleted"]),
-                "unchanged": raw_report["unchanged_count"]
-            },
-            "details": {
-                "created": [],
-                "updated": [],
-                "deleted": []
-            }
-        }
-
-        # ✅ CRÉATIONS (avec nom lisible)
-        for c in raw_report["created"]:
-            try:
-                data = storage_manager.get_json(f"blobs/{c['hash']}.json")
-                detailed_report["details"]["created"].append({
-                    **c,
-                    "display_name": self._get_display_name(c["type"], data)
-                })
-            except Exception as e:
-                logger.error(f"Erreur création {c['type']}/{c['id']}: {e}")
-                detailed_report["details"]["created"].append({
-                    **c, "display_name": f"{c['type']}/{c['id'][:8]}"
-                })
-
-        # ✅ SUPPRESSIONS (avec nom lisible)
-        for d in raw_report["deleted"]:
-            try:
-                data = storage_manager.get_json(f"blobs/{d['hash']}.json")
-                detailed_report["details"]["deleted"].append({
-                    **d,
-                    "display_name": self._get_display_name(d["type"], data)
-                })
-            except Exception:
-                detailed_report["details"]["deleted"].append({
-                    **d, "display_name": f"{d['type']}/{d['id'][:8]}"
-                })
-
-        # 🔥 MISES À JOUR DÉTAILLÉES (comparaison prop par prop)
-        for item in raw_report["updated"]:
-            try:
-                old_data = storage_manager.get_json(f"blobs/{item['old_hash']}.json")
-                new_data = storage_manager.get_json(f"blobs/{item['new_hash']}.json")
-                
-                old_props = old_data.get("properties", old_data)
-                new_props = new_data.get("properties", new_data)
-                
-                changes = {}
-                all_keys = set(old_props.keys()) | set(new_props.keys())
-                
-                # ✅ FILTRES AGNOSTIQUES (dates/timestamps génériques)
-                ignored_patterns = [
-                    "lastmodified", "modified", "updated", "created", 
-                    "hs_object_id", "object_id", "id", "_zibridge"
-                ]
-                
-                for key in all_keys:
-                    # Ignore les timestamps génériques
-                    if any(pattern in key.lower() for pattern in ignored_patterns):
-                        continue
-                    
-                    old_val = old_props.get(key)
-                    new_val = new_props.get(key)
-                    
-                    if old_val != new_val and str(old_val) != str(new_val):
-                        changes[key] = {
-                            "old": old_val,
-                            "new": new_val,
-                            "type": type(old_val).__name__ if old_val is not None else "null"
-                        }
-                
-                # ✅ COMPARE LES LIENS (suture)
-                old_links = old_data.get("_zibridge_links", {})
-                new_links = new_data.get("_zibridge_links", {})
-                if old_links != new_links:
-                    changes["relations"] = {
-                        "old": old_links,
-                        "new": new_links
-                    }
-
-                if changes:
-                    detailed_report["details"]["updated"].append({
-                        "type": item["type"],
-                        "id": item["id"],
-                        "display_name": self._get_display_name(item["type"], old_data),
-                        "changes": changes,
-                        "change_count": len(changes)
-                    })
-
-            except Exception as e:
-                logger.error(f"Erreur diff détaillé {item['type']}/{item['id']}: {e}")
-
-        logger.success(f"✅ Rapport Diff généré: {detailed_report['summary']}")
-        return detailed_report
+        old_props = old_data.get("properties", old_data)
+        new_props = new_data.get("properties", new_data)
+        
+        diff = {}
+        all_keys = set(old_props.keys()) | set(new_props.keys())
+        
+        for k in all_keys:
+            if k.startswith("_"): continue
+            v1, v2 = old_props.get(k), new_props.get(k)
+            if str(v1) != str(v2):
+                diff[k] = {"old": v1, "new": v2}
+        
+        return diff

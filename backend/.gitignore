@@ -27,3 +27,15 @@ data/redis/
 .coverage
 .pytest_cache/
 htmlcov/
+
+# macOS
+.DS_Store
+
+# Données applicatives locales
+data/uploads/
+*.csv
+
+# Scripts locaux / tests manuels
+quick_start.py
+test_sync_results.py
+create_tables.py

@@ -2,96 +2,84 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 from sqlmodel import Field, SQLModel, JSON, Column
 
-
+# --- PROJET ---
 class SnapshotProject(SQLModel, table=True):
-    """
-    Onglet/Workspace isolé pour regrouper des snapshots.
-    Exemple : "Import CSV Q4", "HubSpot Production", "Test Salesforce"
-    100% AGNOSTIQUE - s'adapte à tout type de source.
-    """
     id: Optional[int] = Field(default=None, primary_key=True)
-    name: str = Field(index=True)  # "Import CSV Q4"
-    description: Optional[str] = None  # Description optionnelle
-    icon: str = Field(default="📸")  # Emoji/icône personnalisé
-    
-    # Type de source par défaut pour ce projet
-    default_source_type: str = Field(default="api")  # "api" ou "file"
-    
-    # Configuration agnostique (JSON flexible)
+    name: str = Field(index=True)
+    description: Optional[str] = None
+    icon: str = Field(default="📸")
+    default_source_type: str = Field(default="api")
+    # Stocke le mapping agnostique et les objets activés
+    enabled_objects: List[str] = Field(default_factory=list, sa_column=Column(JSON))
     config: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    # Exemples :
-    # {"provider": "hubspot", "token": "xxx"}
-    # {"provider": "salesforce", "instance_url": "xxx", "token": "yyy"}
-    # {"provider": "csv", "default_path": "/uploads/"}
-    
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
-    
-    # Ordre d'affichage dans la sidebar
     display_order: int = Field(default=0)
 
+# --- GIT : BRANCHES ---
+class Branch(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="snapshotproject.id", index=True)
+    name: str = Field(index=True)
+    base_snapshot_id: Optional[int] = None
+    current_snapshot_id: Optional[int] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
+# --- GIT : COMMITS (SNAPSHOTS) ---
 class Snapshot(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    
-    # 🔥 Lien vers le projet parent (onglet)
-    project_id: int = Field(
-    foreign_key="snapshotproject.id",
-    index=True,
-    nullable=False
-)
-
+    project_id: int = Field(foreign_key="snapshotproject.id", index=True)
+    branch_id: Optional[int] = Field(foreign_key="branch.id", index=True, nullable=True)
     
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    source_name: str  # ex: "CSV_File", "HubSpot_Prod"
-    source_type: str = Field(default="api")  # api, file, database
-    status: str = Field(default="pending") 
+    source_name: str 
+    source_type: str = Field(default="api")
+    status: str = Field(default="pending", index=True) 
     
-    # ✅ COMPTEURS DYNAMIQUES (backward compatible)
-    companies_count: int = Field(default=0)
-    contacts_count: int = Field(default=0)
-    deals_count: int = Field(default=0)
-    tickets_count: int = Field(default=0)
+    # Stats dynamiques (Elon Mode)
+    stats: Dict[str, int] = Field(default_factory=dict, sa_column=Column(JSON))
     total_objects: int = Field(default=0)
     
-    # 🔥 AGNOSTIQUE TOTAL
-    detected_entities: Dict[str, int] = Field(default_factory=dict, sa_column=Column(JSON))
-    # Ex: {"company": 100, "contact": 100, "custom_0": 50}
+    # Merkle Root pour le Smart Diff
+    root_hash: Optional[str] = Field(default=None, index=True)
     
+    detected_entities: Dict[str, int] = Field(default_factory=dict, sa_column=Column(JSON))
     snapshot_metadata: Dict[str, Any] = Field(default={}, sa_column=Column(JSON))
+    sync_config: Dict[str, Any] = Field(default={}, sa_column=Column(JSON))
 
-
+# --- STORAGE : BLOBS (IMMUABLE) ---
 class Blob(SQLModel, table=True):
-    """L'archive unique (CAS). Identifiée par son hash SHA-256."""
-    hash: str = Field(primary_key=True)
-    content_type: str  # ex: "company", "contact", "custom_0"
+    hash: str = Field(primary_key=True, max_length=64)
+    content_type: str = Field(index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-
+# --- LIEN ITEM <-> VERSION ---
 class SnapshotItem(SQLModel, table=True):
-    """Le lien entre un snapshot et un objet à un instant T."""
     id: Optional[int] = Field(default=None, primary_key=True)
     snapshot_id: int = Field(foreign_key="snapshot.id", index=True)
-    object_id: str  # L'ID original de la source
-    object_type: str  # AGNOSTIQUE: "companies", "custom_0s"
+    object_id: str = Field(index=True) 
+    object_type: str = Field(index=True) 
     content_hash: str = Field(foreign_key="blob.hash", index=True)
     source_namespace: str = Field(default="default", index=True)
 
+# --- STORAGE FINAL (NORMALISÉ) ---
+# 🛡️ C'est cette classe qui manquait dans ton erreur !
+class NormalizedStorage(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="snapshotproject.id", index=True)
+    object_type: str = Field(index=True) 
+    global_id: str = Field(index=True) 
+    data: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    
+    last_snapshot_id: int = Field(index=True)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
 
+# --- MAPPING D'IDS ---
 class IdMapping(SQLModel, table=True):
-    """Table de suture : réconcilie les IDs entre le backup et le CRM actuel."""
     id: Optional[int] = Field(default=None, primary_key=True)
-    snapshot_id: int = Field(index=True)
-    object_type: str  # AGNOSTIQUE: "companies", "custom_0s"
-    old_id: str 
-    new_id: str 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-
-class SQLModelBase(SQLModel):
-    """Classe de base pour tous les objets versionnés."""
-    id: Optional[int] = Field(default=None, primary_key=True)
-    external_id: str
-    snapshot_id: int
-    object_type: str  # "companies", "contacts", "custom_0s"
+    project_id: int = Field(foreign_key="snapshotproject.id", index=True)
+    object_type: str = Field(index=True)
+    source_system: str = Field(index=True)
+    old_id: str = Field(index=True)
+    new_id: str = Field(index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)

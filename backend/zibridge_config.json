@@ -1,8 +1,42 @@
 {
+  "version": "1.4.0",
+  "settings": {
+    "batch_size": 500,
+    "storage_provider": "minio",
+    "hashing_algorithm": "sha256"
+  },
   "ignore_columns": [
     "last_update",
     "sync_timestamp",
     "temp_id",
-    "updated_at"
-  ]
+    "updated_at",
+    "hs_lastmodifieddate",
+    "hs_modified_by_app_id",
+    "hs_object_id",
+    "createdate",
+    "modifiedat",
+    "last_synced",
+    "system_fingerprint",
+    "_zibridge_meta",
+    "_zibridge_links"
+  ],
+  "default_mappings": {
+    "contact": {
+      "unique_id": "email",
+      "display_name": ["firstname", "lastname", "email"]
+    },
+    "company": {
+      "unique_id": "domain",
+      "display_name": ["name", "domain"]
+    },
+    "deal": {
+      "unique_id": "id",
+      "display_name": ["dealname", "amount"]
+    }
+  },
+  "diff_settings": {
+    "precision": "high",
+    "ignore_null_to_empty": true,
+    "detect_renamed_columns": true
+  }
 }

@@ -27,6 +27,8 @@ class MinioSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 class Settings(BaseSettings):
+# Ajout d'un tag d'environnement pour ton "Storage de Normalisation"  
+    app_env: str = Field(default="development", alias="APP_ENV")
     # Ici, on instancie les classes. 
     # Elles iront chercher leurs propres variables grâce à leur model_config
     postgres: PostgresSettings = PostgresSettings()
